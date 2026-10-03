@@ -37,6 +37,25 @@ A self-hosted World of Warcraft character dashboard that uses the official Battl
 - **All expansion tiers** — Shows every expansion's profession tier, not just current
 - **Secondary professions** — Cooking, Fishing, Archaeology and other secondaries tracked separately
 
+### 🗝️ Mythic+ Breakdown (`/mythic-plus`)
+- **Dungeon matrix** — Best key per dungeon for every character, coloured timed / depleted, with run details on hover
+- **M+ rating** — Current season rating, in Blizzard's rating colour
+- **Vault estimate** — Mythic+ Great Vault slots (1st/4th/8th run) from this week's runs; reward item levels come from `data/vault_ilvl.json` (placeholder values — edit for the current season)
+
+### 🛡️ Equipment Inspector (`/equipment`)
+- **Paperdoll view** — All gear slots with quality borders, item level, enchants and gems
+- **Gear check** — Warns about missing enchants and empty gem sockets; enchant slots are configurable in `data/gear_rules.json`
+- **Secondary stats** — Crit, Haste, Mastery and Versatility bars plus primary stat, stamina and armor
+
+> Both pages fetch lazily on first visit and cache for 10 minutes (append `?refresh=1` to force a re-fetch).
+
+### 🏆 Achievements (`/achievements`)
+- **Character picker** — Choose any character; your last selection is remembered (Blizzard has no account-wide achievements API, so this is per character)
+- **Current expansion** — Every achievement in the current expansion's categories, with progress bars
+- **Almost there** — Achievements from other expansions once you are 80%+ complete
+- **Search, filters and pins** — Find achievements fast, filter by status, and pin the ones you are chasing (saved in `localStorage`)
+- **Configurable scope** — Expansion category name(s) and the 80% threshold live in `data/achievement_scope.json`
+
 ### 🌐 General
 - **Battle.net OAuth2** — Secure login; no passwords stored
 - **Parallel API fetching** — All character data fetched concurrently for fast load times
@@ -114,6 +133,9 @@ Then open [http://localhost:8081](http://localhost:8081) in your browser and cli
 | `/vault` | Great Vault tracker — drag-and-drop weekly slot planner |
 | `/roster` | Weekly Roster — per-character weekly task checklist |
 | `/professions` | Profession Tracker — cross-character profession skill matrix |
+| `/achievements` | Achievements — current expansion plus anything 80%+ complete |
+| `/mythic-plus` | Mythic+ dungeon matrix, rating and vault estimate |
+| `/equipment` | Equipment Inspector — gear, enchants/gems check, secondary stats |
 | `/refresh` | Force re-fetch of all character data from Battle.net |
 
 ---

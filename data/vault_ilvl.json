@@ -1,0 +1,7 @@
+{
+  "note": "Reward item levels are placeholders (TWW-era values) — edit data/vault_ilvl.json to match the current season.",
+  "mythic_plus": {
+    "0": 681, "2": 684, "3": 688, "4": 691, "5": 694,
+    "6": 697, "7": 701, "8": 704, "9": 704, "10": 710
+  }
+}

@@ -29,6 +29,9 @@ COPY --from=builder /app/wow_stats .
 # Copy the images directory
 COPY images/ ./images/
 
+# Copy data files (gear rules, vault item levels, achievements maps)
+COPY data/ ./data/
+
 # Expose port
 EXPOSE 8080
 

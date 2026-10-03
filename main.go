@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -46,6 +47,8 @@ type CharacterStats struct {
 	LastRaidTime     int64  // Unix timestamp (ms) of the kill
 	Error            string
 	LastUpdate       time.Time
+	Currencies       map[int64]int64  // currencyID -> amount
+	CurrencyNames    map[int64]string // currencyID -> friendly name
 }
 
 type ProfessionTier struct {
@@ -80,13 +83,15 @@ type AccountSummary struct {
 }
 
 var (
-	config         Config
-	accountSummary AccountSummary
-	summaryMutex   sync.RWMutex
-	oauth2Config   *oauth2.Config
-	userToken      *oauth2.Token
-	tokenMutex     sync.RWMutex
-	oauthState     string
+	config              Config
+	accountSummary      AccountSummary
+	summaryMutex        sync.RWMutex
+	oauth2Config        *oauth2.Config
+	userToken           *oauth2.Token
+	tokenMutex          sync.RWMutex
+	oauthState          string
+	currencyNameToID    map[string]int64
+	currencyCacheMutex  sync.RWMutex
 )
 
 func main() {
@@ -130,6 +135,9 @@ func main() {
 	// Optional persistence — safe to skip if DATABASE_URL is not set
 	initDB()
 
+	// Initialize currency cache
+	currencyNameToID = make(map[string]int64)
+
 	// Setup HTTP routes
 	http.HandleFunc("/", handleHome)
 	http.HandleFunc("/login", handleLogin)
@@ -137,12 +145,20 @@ func main() {
 	http.HandleFunc("/logout", handleLogout)
 	http.HandleFunc("/refresh", handleRefresh)
 	http.HandleFunc("/vault", handleVault)
+	http.HandleFunc("/player-currency", handlePlayerCurrency)
+	http.HandleFunc("/debug/char-currencies", handleDebugCharacterCurrencies)
+	http.HandleFunc("/debug/accounts", handleDebugAccounts)
+	http.HandleFunc("/achievements", handleAchievements)
+	http.HandleFunc("/api/achievement", handleAPIAchievement)
 	http.HandleFunc("/roster", handleRoster)
 	http.HandleFunc("/professions", handleProfessions)
 	http.HandleFunc("/history", handleHistory)
+	http.HandleFunc("/mythic-plus", handleMythicPlus)
+	http.HandleFunc("/equipment", handleEquipment)
 	http.HandleFunc("/api/stats", handleAPIStats)
 	http.HandleFunc("/debug/raids", handleDebugRaids)
 	http.HandleFunc("/debug/profile", handleDebugProfile)
+	http.HandleFunc("/debug/protected", handleDebugProtected)
 
 	// Serve static files (images)
 	fs := http.FileServer(http.Dir("./images"))
@@ -609,6 +625,56 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 					} else {
 						log.Printf("Character %s-%s: No money/gold in protected endpoint", realm, name)
 					}
+
+					// Attempt to extract currency-like structures from protectedData
+					// Some characters expose currencies in arrays under keys like 'currencies' or 'currency'
+					tryKeys := []string{"currencies", "currency", "currency_list", "currencies_owned", "currenciesOwned"}
+					stats.Currencies = make(map[int64]int64)
+					stats.CurrencyNames = make(map[int64]string)
+					for _, k := range tryKeys {
+						if v, ok := protectedData[k]; ok {
+							if arr, ok := v.([]interface{}); ok {
+								for _, it := range arr {
+									if m, ok := it.(map[string]interface{}); ok {
+										var id int64
+										var amt int64
+										var nm string
+										if vv, ok := m["id"].(float64); ok {
+											id = int64(vv)
+										}
+										if vv, ok := m["amount"].(float64); ok {
+											amt = int64(vv)
+										}
+										if vv, ok := m["quantity"].(float64); ok {
+											amt = int64(vv)
+										}
+										if vv, ok := m["currency"].(map[string]interface{}); ok {
+											if iid, ok := vv["id"].(float64); ok {
+												id = int64(iid)
+											}
+											if nmv, ok := vv["name"].(string); ok {
+												nm = nmv
+											}
+										}
+										if id != 0 {
+											stats.Currencies[id] = amt
+											if nm != "" {
+												stats.CurrencyNames[id] = nm
+												currencyCacheMutex.Lock()
+												currencyNameToID[strings.ToLower(nm)] = id
+												currencyCacheMutex.Unlock()
+											}
+										}
+									}
+								}
+								// If we extracted something, stop looking
+								if len(stats.Currencies) > 0 {
+									log.Printf("Extracted %d currencies from protected data for %s-%s", len(stats.Currencies), name, realm)
+									break
+								}
+							}
+						}
+					}
 				}
 			} else {
 				log.Printf("Protected endpoint returned HTTP %d for %s", protectedResp.StatusCode, name)
@@ -680,6 +746,254 @@ func getKeys(m map[string]interface{}) []string {
 	return keys
 }
 
+// resolveCurrencyIDs will query the Blizzard Game Data API currency index to map friendly names
+// (lowercased) to currency IDs. Results are cached in memory.
+func resolveCurrencyIDs(names []string) map[string]int64 {
+	result := make(map[string]int64)
+
+	// Check cache first
+	currencyCacheMutex.RLock()
+	for _, n := range names {
+		if id, ok := currencyNameToID[strings.ToLower(n)]; ok {
+			result[n] = id
+		}
+	}
+	currencyCacheMutex.RUnlock()
+
+	// If all found in cache, return
+	if len(result) == len(names) {
+		return result
+	}
+
+	// Need to fetch the currency index from Game Data API using client credentials
+
+	// Use basic HTTP client without user token — we will call the Game Data API with client credentials
+	// Build token URL
+	tokenURL := fmt.Sprintf("https://%s.battle.net/oauth/token", config.Region)
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+
+	req, _ := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	req.SetBasicAuth(config.ClientID, config.ClientSecret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("Failed to fetch app token: %v", err)
+		return result
+	}
+	defer resp.Body.Close()
+	var tokResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokResp); err != nil {
+		log.Printf("Failed to decode app token response: %v", err)
+		return result
+	}
+
+	// Fetch currency index
+	idxURL := fmt.Sprintf("https://%s.api.blizzard.com/data/wow/currency/index?namespace=static-%s&locale=%s", config.Region, config.Region, config.Locale)
+	req2, _ := http.NewRequest("GET", idxURL, nil)
+	req2.Header.Set("Authorization", "Bearer "+tokResp.AccessToken)
+
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		log.Printf("Failed to fetch currency index: %v", err)
+		return result
+	}
+	defer resp2.Body.Close()
+	var idx struct {
+		Currencies []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"currencies"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&idx); err != nil {
+		log.Printf("Failed to decode currency index: %v", err)
+		return result
+	}
+
+	currencyCacheMutex.Lock()
+	defer currencyCacheMutex.Unlock()
+	for _, c := range idx.Currencies {
+		lname := strings.ToLower(c.Name)
+		currencyNameToID[lname] = c.ID
+	}
+	for _, n := range names {
+		if id, ok := currencyNameToID[strings.ToLower(n)]; ok {
+			result[n] = id
+		}
+	}
+	return result
+}
+
+// fetchCharacterCurrencies fetches character-specific currencies and returns a map currencyID->amount.
+func fetchCharacterCurrencies(client *http.Client, realm, name string, desiredIDs []int64) map[int64]int64 {
+	res := make(map[int64]int64)
+	normalizedRealm := strings.ToLower(realm)
+	normalizedName := strings.ToLower(name)
+	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/currencies?namespace=profile-%s&locale=%s",
+		config.Region, normalizedRealm, normalizedName, config.Region, config.Locale)
+
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("Error fetching currencies for %s-%s: %v", realm, name, err)
+		return res
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Currencies endpoint returned HTTP %d for %s-%s", resp.StatusCode, realm, name)
+		return res
+	}
+
+	var payload struct {
+		Currencies []struct {
+			ID     int64 `json:"currency"` // sometimes nested, be flexible
+			Amount int64 `json:"quantity"`
+		} `json:"currencies"`
+	}
+	// Attempt to decode flexibly
+	body, _ := io.ReadAll(resp.Body)
+	// try quick decode
+	if err := json.Unmarshal(body, &payload); err != nil {
+		// Fallback: generic parse
+		var generic map[string]interface{}
+		if err := json.Unmarshal(body, &generic); err != nil {
+			log.Printf("Failed to parse currencies JSON for %s-%s: %v", realm, name, err)
+			return res
+		}
+		if arr, ok := generic["currencies"].([]interface{}); ok {
+			for _, it := range arr {
+				if m, ok := it.(map[string]interface{}); ok {
+					var id int64
+					var amt int64
+					if v, ok := m["id"].(float64); ok {
+						id = int64(v)
+					}
+					if v, ok := m["currency"].(map[string]interface{}); ok {
+						if idf, ok := v["id"].(float64); ok {
+							id = int64(idf)
+						}
+					}
+					if v, ok := m["amount"].(float64); ok {
+						amt = int64(v)
+					}
+					if v, ok := m["quantity"].(float64); ok {
+						amt = int64(v)
+					}
+					if id != 0 {
+						res[id] = amt
+					}
+				}
+			}
+		}
+		return res
+	}
+	for _, c := range payload.Currencies {
+		if c.ID != 0 {
+			res[c.ID] = c.Amount
+		}
+	}
+	return res
+}
+
+// handlePlayerCurrency renders a page showing requested currencies per-character.
+func handlePlayerCurrency(w http.ResponseWriter, r *http.Request) {
+	summaryMutex.RLock()
+	data := accountSummary
+	summaryMutex.RUnlock()
+
+	// Desired currency names (user-specified)
+	desired := []string{"Dawncrests", "Radiant Spark Dust", "Dawnlight Manaflux", "Coffer Key Shards", "Restored Coffer Keys", "Voidlight Marl"}
+
+	// Resolve names to IDs (may populate cache)
+	nameToID := resolveCurrencyIDs(desired)
+
+	// Ensure CharacterStats has Currencies and CurrencyNames populated for current snapshot
+	// We'll use the existing OAuth token to fetch character currencies per-character
+	tokenMutex.RLock()
+	tkn := userToken
+	tokenMutex.RUnlock()
+
+	if tkn != nil {
+		ctx := context.Background()
+		client := oauth2Config.Client(ctx, tkn)
+		for i := range data.Characters {
+			ch := &data.Characters[i]
+			ids := make([]int64, 0, len(nameToID))
+			for _, id := range nameToID {
+				ids = append(ids, id)
+			}
+			ch.Currencies = fetchCharacterCurrencies(client, ch.Realm, ch.Name, ids)
+			ch.CurrencyNames = make(map[int64]string)
+			for n, id := range nameToID {
+				ch.CurrencyNames[id] = n
+			}
+		}
+	}
+
+	// Build ordered list of currency IDs and names for the template
+	orderedIDs := make([]int64, 0, len(desired))
+	namesByID := make(map[int64]string)
+	for _, d := range desired {
+		if id, ok := nameToID[d]; ok {
+			orderedIDs = append(orderedIDs, id)
+			namesByID[id] = d
+		}
+	}
+
+	view := struct {
+		Account       AccountSummary
+		CurrencyOrder []int64
+		CurrencyNames map[int64]string
+	}{
+		Account:       data,
+		CurrencyOrder: orderedIDs,
+		CurrencyNames: namesByID,
+	}
+
+	tmpl := template.Must(template.New("player-currency").Funcs(template.FuncMap{
+		"formatGold": formatGold,
+		"lower":      strings.ToLower,
+		"urlquery":   url.QueryEscape,
+	}).Parse(playerCurrencyTemplate))
+
+	if err := tmpl.Execute(w, view); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// Simple player currency page template
+var playerCurrencyTemplate = `
+<html><head><title>Player Currency</title></head><body>
+<h1>Player Currency</h1>
+<p>This page displays selected currencies per-character (requires you to be logged in).</p>
+{{if not .Account.Authenticated}}
+<p>Please <a href="/login">log in</a> to view per-character currencies.</p>
+{{else}}
+<table border="1" cellpadding="6" cellspacing="0">
+<tr>
+    <th>Character</th>
+    {{- range $i, $cid := .CurrencyOrder}}
+        <th>{{index $.CurrencyNames $cid}}</th>
+    {{- end}}
+</tr>
+{{range .Account.Characters}}
+    <tr>
+        <td>{{.Name}} ({{.Realm}})</td>
+        {{- if .Currencies}}
+            {{- range $i, $cid := $.CurrencyOrder}}
+                <td>{{index .Currencies $cid}}</td>
+            {{- end}}
+        {{- else}}
+            <td colspan="{{len $.CurrencyOrder}}">No currency data (not authenticated or API error)</td>
+        {{- end}}
+    </tr>
+{{end}}
+</table>
+{{end}}
+</body></html>`
+
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	// Check whether the stored token has expired; if so, clear it so the
 	// login prompt is shown instead of stale/broken data.
@@ -707,6 +1021,8 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 		"formatGold":      formatGold,
 		"formatLastLogin": formatLastLogin,
 		"getClassIcon":    getClassIcon,
+		"lower":           strings.ToLower,
+		"urlquery":        url.QueryEscape,
 	}).Parse(htmlTemplate))
 
 	if err := tmpl.Execute(w, data); err != nil {
@@ -720,6 +1036,7 @@ func handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	clearExtraCaches()
 	// Run in background so the browser isn't left waiting for all API calls to finish
 	go fetchCharacterData()
 
@@ -781,6 +1098,111 @@ func handleDebugRaids(w http.ResponseWriter, r *http.Request) {
 	enc.Encode(raw)
 }
 
+// handleDebugCharacterCurrencies returns the raw currencies payload from the Blizzard Profile API
+func handleDebugCharacterCurrencies(w http.ResponseWriter, r *http.Request) {
+	tokenMutex.RLock()
+	tok := userToken
+	tokenMutex.RUnlock()
+
+	if tok == nil {
+		http.Error(w, "Not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	realm := r.URL.Query().Get("realm")
+	name := r.URL.Query().Get("name")
+	if realm == "" || name == "" {
+		http.Error(w, "realm and name query parameters required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+	// Create an HTTP client that ignores environment proxies to avoid accidental
+	// proxying back to our local server (which can cause recursive HTML responses).
+	tr := &http.Transport{Proxy: nil}
+	client := &http.Client{Transport: tr}
+
+	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/currencies?namespace=profile-%s&locale=%s",
+		config.Region, strings.ToLower(realm), strings.ToLower(name), config.Region, config.Locale)
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	// Attach the user's access token explicitly (we're not using oauth2 client here
+	// to ensure the request bypasses proxy settings).
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Request failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read body and prepare a structured JSON response that includes
+	// Blizzard's status, headers, and a body snippet for easier diagnosis.
+	bodyBytes, _ := io.ReadAll(resp.Body)
+
+	headers := make(map[string]string)
+	for k, vals := range resp.Header {
+		headers[k] = strings.Join(vals, ", ")
+	}
+
+	out := map[string]interface{}{
+		"status":  resp.StatusCode,
+		"headers": headers,
+		"body_snippet": func() string {
+			s := string(bodyBytes)
+			if len(s) > 2000 {
+				return s[:2000]
+			}
+			return s
+		}(),
+	}
+
+	// Forward Blizzard's HTTP status code so callers see the real status.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	json.NewEncoder(w).Encode(out)
+}
+
+// handleDebugAccounts fetches the account-level profile data (profile/user/wow)
+func handleDebugAccounts(w http.ResponseWriter, r *http.Request) {
+	tokenMutex.RLock()
+	tok := userToken
+	tokenMutex.RUnlock()
+
+	if tok == nil {
+		http.Error(w, "Not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	ctx := context.Background()
+	tr := &http.Transport{Proxy: nil}
+	client := &http.Client{Transport: tr}
+	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=profile-%s&locale=%s", config.Region, config.Region, config.Locale)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Request failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "text/html") || r.URL.Query().Get("format") == "html" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(resp.StatusCode)
+		// Wrap JSON in a <pre> so browsers show it plainly
+		fmt.Fprintf(w, "<html><body><pre>%s</pre></body></html>", template.HTMLEscapeString(string(body)))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
 // handleDebugProfile fetches the raw profile API response for any character
 // so we can see exactly what Blizzard returns, including error bodies on 404.
 // Usage: /debug/profile?realm=the-maelstrom&name=cesard
@@ -817,6 +1239,50 @@ func handleDebugProfile(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := io.ReadAll(resp.Body)
 	log.Printf("DEBUG profile HTTP %d for %s-%s: %s", resp.StatusCode, realm, name, string(body))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+// handleDebugProtected fetches a given protected-character href (passed via ?href=)
+// and returns the raw body; useful for inspecting protected payloads (currencies, houses, etc).
+func handleDebugProtected(w http.ResponseWriter, r *http.Request) {
+	tokenMutex.RLock()
+	tok := userToken
+	tokenMutex.RUnlock()
+
+	if tok == nil {
+		http.Error(w, "Not authenticated", http.StatusUnauthorized)
+		return
+	}
+
+	href := r.URL.Query().Get("href")
+	if href == "" {
+		http.Error(w, "missing ?href= URL", http.StatusBadRequest)
+		return
+	}
+
+	// Only allow Blizzard API domains for safety
+	if !(strings.Contains(href, "api.blizzard.com") || strings.Contains(href, "blizzard.com")) {
+		http.Error(w, "href must be a Blizzard API URL", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+	tr := &http.Transport{Proxy: nil}
+	client := &http.Client{Transport: tr}
+	req, _ := http.NewRequestWithContext(ctx, "GET", href, nil)
+	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Request failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
@@ -972,7 +1438,13 @@ var historyTemplate = `<!DOCTYPE html>
         .nav-btn-history:hover { border-color: #80c0ff; background: linear-gradient(135deg, rgba(30,70,120,0.9), rgba(15,50,100,0.9)); }
         .nav-btn-logout { background: linear-gradient(135deg, rgba(80,20,20,0.8), rgba(50,10,10,0.8));     border-color: #a04040; color: #ffaaaa; }
         .nav-btn-logout:hover { border-color: #e06060; background: linear-gradient(135deg, rgba(120,30,30,0.9), rgba(80,15,15,0.9)); }
+    .chip-action { color: #f8e6c8; text-decoration: none; font-size: 0.95em; padding: 4px; border-radius:4px; }
+    .chip-action:hover { background: rgba(255,255,255,0.03); }
         .logo { max-width: 350px; height: auto; filter: drop-shadow(0 4px 8px rgba(0,0,0,0.5)); margin-bottom: 5px; }
+    /* Keep action buttons from shrinking the name; make them compact */
+    .char-actions { display:flex; gap:6px; align-items:center; flex-shrink:0; }
+    .char-action-btn { background: rgba(60,48,32,0.6); color: #f8e6c8; padding:4px 6px; border-radius:6px; border:1px solid rgba(90,70,40,0.4); text-decoration:none; font-size:0.82em; white-space:nowrap; }
+    .char-action-btn:hover { background: rgba(100,80,60,0.6); }
 
         /* ── PAGE CONTENT ── */
         .page-header {
@@ -1061,6 +1533,7 @@ var historyTemplate = `<!DOCTYPE html>
             font-size: 0.8em; color: #9b8a6e; margin-bottom: 6px;
             text-align: center; letter-spacing: 0.5px; text-transform: uppercase;
         }
+`+navLayoutCSS+`
     </style>
 </head>
 <body>
@@ -1069,28 +1542,7 @@ var historyTemplate = `<!DOCTYPE html>
     <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
     </a>
-    <div class="header-nav-btns">
-        <a href="/" class="nav-btn">🏠 Home</a>
-        <a href="/vault" class="nav-btn nav-btn-vault">
-            <img src="/images/vault-button.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            Great Vault
-        </a>
-        <a href="/roster" class="nav-btn nav-btn-roster">
-            <img src="/images/quest.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            Weekly Roster
-        </a>
-        <a href="/professions" class="nav-btn nav-btn-prof">
-            <img src="/images/professions.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            Professions
-        </a>
-        <a href="/history" class="nav-btn nav-btn-history">
-            <img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            History
-        </a>
-        <a href="/logout" class="nav-btn nav-btn-logout">
-            🔓 Re-authenticate
-        </a>
-    </div>
+    `+navHTML+`
     <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
 </header>
 </div>
@@ -1566,6 +2018,7 @@ var professionsTemplate = `<!DOCTYPE html>
 
         /* ── Character cards section (mobile fallback) ── */
         .section-hidden { display: none; }
+`+navLayoutCSS+`
     </style>
 </head>
 <body>
@@ -1574,28 +2027,7 @@ var professionsTemplate = `<!DOCTYPE html>
     <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
     </a>
-    <div class="header-nav-btns">
-        <a href="/" class="nav-btn">🏠 Home</a>
-        <a href="/vault" class="nav-btn nav-btn-vault">
-            <img src="/images/vault-button.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            Great Vault
-        </a>
-        <a href="/roster" class="nav-btn nav-btn-roster">
-            <img src="/images/quest.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            Weekly Roster
-        </a>
-        <a href="/professions" class="nav-btn nav-btn-prof">
-            <img src="/images/professions.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            Professions
-        </a>
-        <a href="/history" class="nav-btn nav-btn-history">
-            <img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-            History
-        </a>
-        <a href="/logout" class="nav-btn nav-btn-logout">
-            🔓 Re-authenticate
-        </a>
-    </div>
+    `+navHTML+`
     <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
 </header>
 </div>
@@ -1866,7 +2298,6 @@ var professionsTemplate = `<!DOCTYPE html>
 </body>
 </html>
 `
-
 var rosterTemplate = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2221,6 +2652,7 @@ var rosterTemplate = `<!DOCTYPE html>
             padding: 40px;
             color: #9b8a6e;
         }
+`+navLayoutCSS+`
     </style>
 </head>
 <body>
@@ -2229,30 +2661,18 @@ var rosterTemplate = `<!DOCTYPE html>
         <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
             <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
         </a>
-        <div class="header-nav-btns">
-            <a href="/" class="nav-btn">🏠 Home</a>
-            <a href="/vault" class="nav-btn nav-btn-vault">
-                <img src="/images/vault-button.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                Great Vault
-            </a>
-            <a href="/roster" class="nav-btn nav-btn-roster">
-                <img src="/images/quest.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                Weekly Roster
-            </a>
-            <a href="/professions" class="nav-btn nav-btn-prof">
-                <img src="/images/professions.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                Professions
-            </a>
-            <a href="/history" class="nav-btn nav-btn-history">
-                <img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                History
-            </a>
-            <a href="/logout" class="nav-btn nav-btn-logout">
-                🔓 Re-authenticate
-            </a>
-        </div>
+        `+navHTML+`
         <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
     </header>
+</div>
+
+<div class="quick-links" style="max-width:1400px;margin:12px auto 0;padding:10px 20px;">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+    {{range .Characters}}
+        <a class="char-action-btn" href="https://worldofwarcraft.blizzard.com/en-gb/character/eu/{{.Realm | urlquery}}/{{.Name | urlquery}}" target="_blank" rel="noopener">{{.Name}} Profile</a>
+        <a class="char-action-btn" href="https://simplearmory.com/#/eu/{{.Realm | urlquery}}/{{.Name | urlquery}}/achievements/dungeons" target="_blank" rel="noopener">{{.Name}} Dungeons</a>
+    {{end}}
+    </div>
 </div>
 
     <div class="page-header">
@@ -2725,6 +3145,7 @@ var vaultTemplate = `<!DOCTYPE html>
             overflow: hidden;
             text-overflow: ellipsis;
             flex: 1;
+            min-width: 48px; /* ensure some visible room for short names */
         }
         .chip-level {
             font-size: 0.72em;
@@ -2898,6 +3319,7 @@ var vaultTemplate = `<!DOCTYPE html>
             padding: 40px;
             color: #9b8a6e;
         }
+`+navLayoutCSS+`
     </style>
 </head>
 <body>
@@ -2906,28 +3328,7 @@ var vaultTemplate = `<!DOCTYPE html>
         <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
             <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
         </a>
-        <div class="header-nav-btns">
-            <a href="/" class="nav-btn">🏠 Home</a>
-            <a href="/vault" class="nav-btn nav-btn-vault">
-                <img src="/images/vault-button.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                Great Vault
-            </a>
-            <a href="/roster" class="nav-btn nav-btn-roster">
-                <img src="/images/quest.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                Weekly Roster
-            </a>
-            <a href="/professions" class="nav-btn nav-btn-prof">
-                <img src="/images/professions.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                Professions
-            </a>
-            <a href="/history" class="nav-btn nav-btn-history">
-                <img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                History
-            </a>
-            <a href="/logout" class="nav-btn nav-btn-logout">
-                🔓 Re-authenticate
-            </a>
-        </div>
+        `+navHTML+`
         <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
     </header>
 </div>
@@ -2954,8 +3355,7 @@ var vaultTemplate = `<!DOCTYPE html>
             <h3>Your Characters</h3>
             <div class="roster-list" id="roster">
                 {{range .Characters}}
-                {{if ge .Level 90}}
-                <div class="char-chip"
+             <div class="char-chip"
                      draggable="true"
                      data-name="{{.Name}}"
                      data-realm="{{.Realm}}"
@@ -2969,8 +3369,9 @@ var vaultTemplate = `<!DOCTYPE html>
                     <img class="chip-class" src="/images/{{lower .Class}}.png" alt="{{.Class}}" onerror="this.style.display='none'">
                     <span class="chip-name">{{.Name}}</span>
                     <span class="chip-level">{{.Level}}</span>
+                    <div class="char-actions" data-name="{{.Name}}" data-realm="{{.Realm}}"></div>
                 </div>
-                {{end}}
+                
                 {{end}}
             </div>
         </div>
@@ -3796,6 +4197,7 @@ const htmlTemplate = `
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+`+navLayoutCSS+`
     </style>
     <script>
         // Auto-refresh if authenticated but no character data loaded yet
@@ -3848,27 +4250,7 @@ const htmlTemplate = `
                 <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
             </a>
             {{if .Authenticated}}
-            <div class="header-nav-btns">
-                <a href="/vault" class="nav-btn nav-btn-vault">
-                    <img src="/images/vault-button.png" alt="Vault" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                    Great Vault
-                </a>
-                <a href="/roster" class="nav-btn nav-btn-roster">
-                    <img src="/images/quest.png" alt="Roster" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                    Weekly Roster
-                </a>
-                <a href="/professions" class="nav-btn nav-btn-prof">
-                    <img src="/images/professions.png" alt="Professions" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                    Professions
-                </a>
-                <a href="/history" class="nav-btn nav-btn-history">
-                    <img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));">
-                    History
-                </a>
-                <a href="/logout" class="nav-btn nav-btn-logout">
-                    🔓 Re-authenticate
-                </a>
-            </div>
+            `+navHTML+`
             {{end}}
             <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
             {{if .Authenticated}}
@@ -3949,7 +4331,10 @@ const htmlTemplate = `
                 <div class="character-header">
                     <div class="character-info">
                         <div class="character-name">{{.Name}}</div>
-                        <div class="character-realm">{{.Realm}}</div>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <div class="character-realm">{{.Realm}}</div>
+                            <div class="char-actions" data-name="{{.Name}}" data-realm="{{.Realm}}"></div>
+                        </div>
                     </div>
                 </div>
                 {{if eq .Faction "ALLIANCE"}}
