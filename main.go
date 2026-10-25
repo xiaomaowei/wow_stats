@@ -127,8 +127,8 @@ func main() {
 		RedirectURL:  config.RedirectURL,
 		Scopes:       []string{"wow.profile"},
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  fmt.Sprintf("https://%s.battle.net/oauth/authorize", config.Region),
-			TokenURL: fmt.Sprintf("https://%s.battle.net/oauth/token", config.Region),
+			AuthURL:  "https://oauth.battle.net/authorize",
+			TokenURL: "https://oauth.battle.net/token",
 		},
 	}
 
@@ -769,7 +769,7 @@ func resolveCurrencyIDs(names []string) map[string]int64 {
 
 	// Use basic HTTP client without user token — we will call the Game Data API with client credentials
 	// Build token URL
-	tokenURL := fmt.Sprintf("https://%s.battle.net/oauth/token", config.Region)
+	tokenURL := "https://oauth.battle.net/token"
 	data := url.Values{}
 	data.Set("grant_type", "client_credentials")
 

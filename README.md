@@ -112,8 +112,10 @@ PORT=8081
 ### Option A: Go (local)
 
 ```bash
-go run main.go
+go run .
 ```
+
+OAuth uses global endpoints (`oauth.battle.net`), while `REGION` selects game data.
 
 ### Option B: Docker Compose
 
