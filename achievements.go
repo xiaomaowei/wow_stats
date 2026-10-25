@@ -655,10 +655,14 @@ func handleAchievements(w http.ResponseWriter, r *http.Request) {
 		page.NoMatches = true
 	}
 
+	lang := ResolveLanguage(r)
 	tmpl, err := template.New("achievements-page").Funcs(template.FuncMap{
 		"join":  strings.Join,
 		"lower": strings.ToLower,
-	}).Parse(achievementsTemplate)
+		"t": func(k string) string { return T(lang, k) },
+		"tFmt": func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang": func() string { return lang },
+	}).Parse(BuildAchievementsTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -668,7 +672,9 @@ func handleAchievements(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var achievementsTemplate = pageHead + `
+func BuildAchievementsTemplate(lang, currentPath string) string {
+	title := T(lang, "ach.title")
+	extraCSS := `
 .page-header h1 { color: #a0f0ff; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
 .chip { padding: 6px 12px; border: 1px solid #4a4030; border-radius: 16px; color: #f8e6c8; text-decoration: none;
@@ -704,13 +710,18 @@ details.grp[open] > summary { border-color: #30b8c8; }
 .ach.done .bar i { background: #20c87a; }
 .desc { margin-top: 6px; color: #9b8a6e; font-size: .85em; line-height: 1.4; }
 .hidden-by-filter { display: none !important; }
-</style>
-<title>Achievements</title>
-` + pageNav[len("</style>"):] + `
+`
+	jsLoading := template.JSEscapeString(T(lang, "ach.js_loading"))
+	jsNoDesc := template.JSEscapeString(T(lang, "ach.js_no_description"))
+	jsPts := template.JSEscapeString(T(lang, "ach.js_pts"))
+	jsErr := template.JSEscapeString(T(lang, "ach.js_error"))
+
+	return BuildPageHead(lang, extraCSS, title) +
+		BuildPageNav(lang, currentPath) + `
 <div class="page-wrap">
   <div class="page-header">
-    <h1>🏆 Achievements</h1>
-    <p>{{join .Scope.ExpansionNames ", "}} achievements, plus anything else you're {{.Scope.AlmostThreshold}}%+ of the way through</p>
+    <h1>🏆 ` + template.HTMLEscapeString(T(lang, "ach.title")) + `</h1>
+    {{if eq lang "zh-TW"}}<p>{{join .Scope.ExpansionNames ", "}} 成就，以及其他達成進度已達 {{.Scope.AlmostThreshold}}%+ 的成就</p>{{else}}<p>{{join .Scope.ExpansionNames ", "}} achievements, plus anything else you're {{.Scope.AlmostThreshold}}%+ of the way through</p>{{end}}
   </div>
 
   <div class="chips">
@@ -718,46 +729,46 @@ details.grp[open] > summary { border-color: #30b8c8; }
   </div>
 
 {{if .Err}}
-  <div class="card notice-box"><h2>Couldn't load achievements</h2><p>{{.Err}}</p>
-  <p><a href="/achievements?refresh=1&c={{.Selected | urlquery}}" style="color:#80c0ff">Try again</a></p></div>
+  <div class="card notice-box"><h2>` + template.HTMLEscapeString(T(lang, "ach.err_title")) + `</h2><p>{{.Err}}</p>
+  <p><a href="/achievements?refresh=1&c={{.Selected | urlquery}}" style="color:#80c0ff">` + template.HTMLEscapeString(T(lang, "notice.try_again")) + `</a></p></div>
 {{else if .Loading}}
-  <div class="card notice-box"><h2>Loading achievements…</h2>
-  <p>The first load fetches Blizzard's achievement catalogue and may take up to a minute. This page refreshes automatically.</p></div>
+  <div class="card notice-box"><h2>` + template.HTMLEscapeString(T(lang, "ach.loading_title")) + `</h2>
+  <p>` + template.HTMLEscapeString(T(lang, "ach.loading_desc")) + `</p></div>
   <script>setTimeout(function(){ location.reload(); }, 3000);</script>
 {{else}}
   {{with .View}}
   <div class="card summary">
-    <div class="stat"><b>{{.Points}}</b><span>Achievement points</span></div>
-    <div class="stat"><b>{{.Overall}}</b><span>Completed overall</span></div>
-    <div class="stat"><b>{{.ExpDone}} / {{.ExpTotal}}</b><span>Current expansion</span></div>
+    <div class="stat"><b>{{.Points}}</b><span>` + template.HTMLEscapeString(T(lang, "ach.stat_points")) + `</span></div>
+    <div class="stat"><b>{{.Overall}}</b><span>` + template.HTMLEscapeString(T(lang, "ach.stat_overall")) + `</span></div>
+    <div class="stat"><b>{{.ExpDone}} / {{.ExpTotal}}</b><span>` + template.HTMLEscapeString(T(lang, "ach.stat_current_xpac")) + `</span></div>
   </div>
 
   <div class="toolbar">
-    <input id="search" type="search" placeholder="Search achievements…">
-    <button class="fbtn on" data-f="all">All</button>
-    <button class="fbtn" data-f="prog">In progress</button>
-    <button class="fbtn" data-f="done">Completed</button>
-    <button class="fbtn" data-f="none">Not started</button>
+    <input id="search" type="search" placeholder="` + template.HTMLEscapeString(T(lang, "ach.search_placeholder")) + `">
+    <button class="fbtn on" data-f="all">` + template.HTMLEscapeString(T(lang, "ach.filter_all")) + `</button>
+    <button class="fbtn" data-f="prog">` + template.HTMLEscapeString(T(lang, "ach.filter_prog")) + `</button>
+    <button class="fbtn" data-f="done">` + template.HTMLEscapeString(T(lang, "ach.filter_done")) + `</button>
+    <button class="fbtn" data-f="none">` + template.HTMLEscapeString(T(lang, "ach.filter_none")) + `</button>
   </div>
 
   <div id="pinned-wrap" style="display:none">
-    <h2 class="section-title">⭐ Pinned</h2>
+    <h2 class="section-title">` + template.HTMLEscapeString(T(lang, "ach.sec_pinned")) + `</h2>
     <div class="list" id="pinned"></div>
   </div>
 
   {{if $.NoMatches}}
-  <div class="card notice-box"><h2>No current-expansion categories matched</h2>
-  <p>No achievement category is named “{{join $.Scope.ExpansionNames ", "}}”. Edit <code>data/achievement_scope.json</code> to set the right category name(s).</p></div>
+  <div class="card notice-box"><h2>` + template.HTMLEscapeString(T(lang, "ach.no_matches_title")) + `</h2>
+  {{if eq lang "zh-TW"}}<p>沒有名稱為「{{join $.Scope.ExpansionNames ", "}}」的成就分類。請編輯 <code>data/achievement_scope.json</code> 設定正確的分類名稱。</p>{{else}}<p>No achievement category is named “{{join $.Scope.ExpansionNames ", "}}”. Edit <code>data/achievement_scope.json</code> to set the right category name(s).</p>{{end}}</div>
   {{end}}
 
   {{if .Almost}}
-  <h2 class="section-title">🔥 Almost there — {{$.Scope.AlmostThreshold}}%+ (other expansions)</h2>
+  {{if eq lang "zh-TW"}}<h2 class="section-title">🔥 差一點完成 — {{$.Scope.AlmostThreshold}}%+（其他資料片）</h2>{{else}}<h2 class="section-title">🔥 Almost there — {{$.Scope.AlmostThreshold}}%+ (other expansions)</h2>{{end}}
   <div class="list" id="almost">
   {{range .Almost}}{{template "ach" .}}{{end}}
   </div>
   {{end}}
 
-  {{if .Groups}}<h2 class="section-title">Current expansion</h2>{{end}}
+  {{if .Groups}}<h2 class="section-title">` + template.HTMLEscapeString(T(lang, "ach.sec_current_xpac")) + `</h2>{{end}}
   <div id="groups">
   {{range .Groups}}
     <details class="grp" {{if lt .Done .Total}}open{{end}}>
@@ -768,11 +779,11 @@ details.grp[open] > summary { border-color: #30b8c8; }
   </div>
 
   {{if .Recent}}
-  <h2 class="section-title">Recently completed</h2>
+  <h2 class="section-title">` + template.HTMLEscapeString(T(lang, "ach.sec_recent")) + `</h2>
   <div class="list" id="recent">{{range .Recent}}{{template "ach" .}}{{end}}</div>
   {{end}}
 
-  <p class="muted" style="margin-top:20px;font-size:.8em">Refreshed at {{.Updated}} · cached for 10 minutes · <a href="/achievements?refresh=1&c={{$.Selected | urlquery}}" style="color:#80c0ff">force refresh</a> · scope is editable in data/achievement_scope.json</p>
+  <p class="muted" style="margin-top:20px;font-size:.8em">` + fmt.Sprintf(T(lang, "ach.footer_note"), "{{.Updated}}", "<a href=\"/achievements?refresh=1&c={{$.Selected | urlquery}}\" style=\"color:#80c0ff\">"+template.HTMLEscapeString(T(lang, "notice.force_refresh"))+"</a>") + `</p>
   {{end}}
 {{end}}
 </div>
@@ -843,10 +854,10 @@ details.grp[open] > summary { border-color: #30b8c8; }
     if (nm) {
       var card = nm.closest('.ach'), d = card.querySelector('.desc');
       if (d.dataset.loaded) { d.style.display = d.style.display === 'none' ? '' : 'none'; return; }
-      d.dataset.loaded = '1'; d.textContent = 'Loading…';
+      d.dataset.loaded = '1'; d.textContent = '` + jsLoading + `';
       fetch('/api/achievement?id=' + card.dataset.id).then(function(r) { return r.json(); }).then(function(a) {
-        d.textContent = (a.description || 'No description') + (a.reward ? '  🎁 ' + a.reward : '') + (a.points ? '  (' + a.points + ' pts)' : '');
-      }).catch(function() { d.textContent = 'Could not load details.'; delete d.dataset.loaded; });
+        d.textContent = (a.description || '` + jsNoDesc + `') + (a.reward ? '  🎁 ' + a.reward : '') + (a.points ? '  (' + a.points + ' ` + jsPts + `)' : '');
+      }).catch(function() { d.textContent = '` + jsErr + `'; delete d.dataset.loaded; });
     }
   });
   renderPins();
@@ -859,10 +870,13 @@ details.grp[open] > summary { border-color: #30b8c8; }
     <span class="nm">{{if eq .Status "done"}}✔ {{end}}{{.Name}}</span>
     {{if eq .Status "prog"}}<span class="pct">{{.Pct}}%</span>{{end}}
     {{if .When}}<span class="pct">{{.When}}</span>{{end}}
-    <button class="pin" title="Pin">★</button>
+    <button class="pin" title="` + template.HTMLEscapeString(T(lang, "ach.pin_title")) + `">★</button>
   </div>
   {{if .Path}}<div class="path">{{.Path}}</div>{{end}}
   {{if or (eq .Status "prog") (eq .Status "done")}}<span class="bar"><i style="width:{{.Pct}}%"></i></span>{{end}}
   <div class="desc"></div>
 </div>
 {{end}}`
+}
+
+var achievementsTemplate = BuildAchievementsTemplate(LangEn, "/achievements")

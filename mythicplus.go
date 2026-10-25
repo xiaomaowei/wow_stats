@@ -27,6 +27,7 @@ type MPRun struct {
 
 type VaultSlot struct {
 	Label    string // "1st run", "4th run", "8th run"
+	Pos      int
 	Level    int
 	Ilvl     int
 	Unlocked bool
@@ -207,7 +208,7 @@ func fetchMythicProfile(client *http.Client, c CharacterStats, vt vaultTable, re
 	out.WeekRuns = len(weekLevels)
 	sort.Sort(sort.Reverse(sort.IntSlice(weekLevels)))
 	for i, pos := range []int{1, 4, 8} {
-		slot := VaultSlot{Label: fmt.Sprintf("%d%s run", pos, ordinal(pos))}
+		slot := VaultSlot{Label: fmt.Sprintf("%d%s run", pos, ordinal(pos)), Pos: pos}
 		if len(weekLevels) >= pos {
 			slot.Unlocked = true
 			slot.Level = weekLevels[pos-1]
@@ -281,6 +282,8 @@ func fmtDuration(ms int64) string {
 	return fmt.Sprintf("%d:%02d", s/60, s%60)
 }
 
+const defaultVaultIlvlNote = "Reward item levels are placeholders (TWW-era values) — edit data/vault_ilvl.json to match the current season."
+
 func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("refresh") == "1" {
 		clearExtraCaches()
@@ -292,6 +295,8 @@ func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther) // home shows the Battle.net login screen
 		return
 	}
+
+	lang := ResolveLanguage(r)
 
 	mpState.Lock()
 	stale := mpState.fetched.IsZero() || time.Since(mpState.fetched) > cacheTTL
@@ -307,7 +312,11 @@ func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
 	if !page.Loading {
 		page.Updated = fetched.Format("15:04:05")
 		vt := loadVaultTable()
-		page.VaultNote = vt.Note
+		if vt.Note == defaultVaultIlvlNote && lang == LangZhTW {
+			page.VaultNote = T(lang, "mplus.vault_ilvl_placeholder_note")
+		} else {
+			page.VaultNote = vt.Note
+		}
 
 		dset := map[string]bool{}
 		for _, c := range data {
@@ -327,13 +336,14 @@ func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
 				cell := MPCell{Has: ok}
 				if ok {
 					cell.Level, cell.Timed = run.Level, run.Timed
-					status := "Depleted"
+					lang := ResolveLanguage(r)
+					status := T(lang, "mplus.status_depleted")
 					if run.Timed {
-						status = "Timed"
+						status = T(lang, "mplus.status_timed")
 					}
-					cell.Tooltip = fmt.Sprintf("%s +%d — %s in %s (rating %.0f)", d, run.Level, status, fmtDuration(run.DurationMs), run.Rating)
+					cell.Tooltip = fmt.Sprintf("%s +%d — %s %s %s (%s %.0f)", d, run.Level, status, T(lang, "mplus.tooltip_in"), fmtDuration(run.DurationMs), T(lang, "mplus.tooltip_rating"), run.Rating)
 					if len(run.Affixes) > 0 {
-						cell.Tooltip += " — affixes: "
+						cell.Tooltip += " — " + T(lang, "mplus.tooltip_affixes") + ": "
 						for i, a := range run.Affixes {
 							if i > 0 {
 								cell.Tooltip += ", "
@@ -348,7 +358,18 @@ func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tmpl, err := template.New("mplus").Parse(mythicPlusTemplate)
+	tmpl, err := template.New("mplus").Funcs(template.FuncMap{
+		"t":            func(k string) string { return T(lang, k) },
+		"tFmt":         func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":         func() string { return lang },
+		"runsThisWeek": func(n int) string { return TFmt(lang, "mplus.runs_this_week", n) },
+		"slotLabel": func(s VaultSlot) string {
+			if lang == LangZhTW {
+				return TFmt(lang, "mplus.slot_run", s.Pos, "")
+			}
+			return TFmt(lang, "mplus.slot_run", s.Pos, ordinal(s.Pos))
+		},
+	}).Parse(BuildMythicPlusTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -358,7 +379,9 @@ func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var mythicPlusTemplate = pageHead + `
+func BuildMythicPlusTemplate(lang, currentPath string) string {
+	title := T(lang, "mplus.title")
+	extraCSS := `
 .page-header h1 { color: #ffc890; }
 .mp-table { width: 100%; border-collapse: collapse; font-size: .9em; }
 .mp-table th, .mp-table td { padding: 8px 10px; text-align: center; border-bottom: 1px solid #2a2418; }
@@ -379,24 +402,25 @@ var mythicPlusTemplate = pageHead + `
 .slot { flex: 1; text-align: center; padding: 8px 4px; border-radius: 6px; border: 1px dashed #4a4030; color: #4a4030; font-size: .8em; }
 .slot.on { border: 1px solid #a060e0; background: rgba(160,96,224,.12); color: #e8d0ff; }
 .slot b { display: block; font-size: 1.15em; color: #fff; }
-</style>
-<title>Mythic+ Breakdown</title>
-` + pageNav[len("</style>"):] + `
+`
+	return BuildPageHead(lang, extraCSS, title) +
+		BuildPageNav(lang, currentPath) + `
 <div class="page-wrap">
   <div class="page-header">
-    <h1>🗝️ Mythic+ Breakdown</h1>
-    <p>Best key per dungeon for the current season, across your whole roster</p>
+    <h1>🗝️ ` + template.HTMLEscapeString(T(lang, "mplus.title")) + `</h1>
+    <p>` + template.HTMLEscapeString(T(lang, "mplus.subtitle")) + `</p>
   </div>
 {{if .Loading}}
-  <div class="card notice-box"><h2>Fetching Mythic+ data…</h2>
-  <p>Loading from Battle.net — this page will refresh automatically.</p></div>
+  <div class="card notice-box"><h2>` + template.HTMLEscapeString(T(lang, "mplus.loading_title")) + `</h2>
+  <p>` + template.HTMLEscapeString(T(lang, "mplus.loading_desc")) + `</p></div>
   <script>setTimeout(function(){ location.reload(); }, 3000);</script>
 {{else if not .Rows}}
-  <div class="card notice-box"><h2>No characters found</h2><p>No eligible characters. Try <a href="?refresh=1" style="color:#80c0ff">refreshing</a>.</p></div>
+  <div class="card notice-box"><h2>` + template.HTMLEscapeString(T(lang, "mplus.no_chars_title")) + `</h2><p>` +
+		fmt.Sprintf(T(lang, "mplus.no_chars_desc"), `<a href="?refresh=1" style="color:#80c0ff">`+template.HTMLEscapeString(T(lang, "notice.try_refreshing"))+`</a>`) + `</p></div>
 {{else}}
   <div class="card" style="overflow-x:auto">
     <table class="mp-table">
-      <thead><tr><th style="text-align:left">Character</th><th>M+ Rating</th>
+      <thead><tr><th style="text-align:left">` + template.HTMLEscapeString(T(lang, "mplus.th_character")) + `</th><th>` + template.HTMLEscapeString(T(lang, "mplus.th_rating")) + `</th>
       {{range .Dungeons}}<th>{{.}}</th>{{end}}</tr></thead>
       <tbody>
       {{range .Rows}}
@@ -412,25 +436,27 @@ var mythicPlusTemplate = pageHead + `
     </table>
   </div>
 
-  <h2 class="section-title">Great Vault — Mythic+ Rewards This Week</h2>
+  <h2 class="section-title">` + template.HTMLEscapeString(T(lang, "mplus.vault_rewards_title")) + `</h2>
   <p class="muted" style="margin-bottom:14px;font-size:.85em">
-    Estimated from this week's runs that Blizzard reports as best-in-dungeon. Runs that were
-    overwritten by a higher key in the same dungeon are not visible to the API, so the real vault may be higher.
+    ` + template.HTMLEscapeString(T(lang, "mplus.vault_rewards_note")) + `
     {{.VaultNote}}</p>
   <div class="vault-grid">
   {{range .Rows}}{{if .Char.WeekRuns}}
     <div class="vault-card">
-      <h4>{{.Char.Name}} <small>{{.Char.WeekRuns}} run(s) this week</small></h4>
+      <h4>{{.Char.Name}} <small>{{runsThisWeek .Char.WeekRuns}}</small></h4>
       <div class="slots">
       {{range .Char.Vault}}
-        <div class="slot {{if .Unlocked}}on{{end}}">{{.Label}}
-          {{if .Unlocked}}<b>{{if .Ilvl}}{{.Ilvl}}{{else}}?{{end}}</b>+{{.Level}}{{else}}locked{{end}}</div>
+        <div class="slot {{if .Unlocked}}on{{end}}">{{slotLabel .}}
+          {{if .Unlocked}}<b>{{if .Ilvl}}{{.Ilvl}}{{else}}?{{end}}</b>+{{.Level}}{{else}}` + template.HTMLEscapeString(T(lang, "mplus.slot_locked")) + `{{end}}</div>
       {{end}}
       </div>
     </div>
   {{end}}{{end}}
   </div>
-  <p class="muted" style="margin-top:20px;font-size:.8em">Data refreshed at {{.Updated}} · cached for 10 minutes · <a href="?refresh=1" style="color:#80c0ff">force refresh</a></p>
+  <p class="muted" style="margin-top:20px;font-size:.8em">` + fmt.Sprintf(T(lang, "notice.data_refreshed_at"), "{{.Updated}}") + `<a href="?refresh=1" style="color:#80c0ff">` + template.HTMLEscapeString(T(lang, "notice.force_refresh")) + `</a></p>
 {{end}}
 </div>
 </body></html>`
+}
+
+var mythicPlusTemplate = BuildMythicPlusTemplate(LangEn, "/mythic-plus")

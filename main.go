@@ -83,15 +83,15 @@ type AccountSummary struct {
 }
 
 var (
-	config              Config
-	accountSummary      AccountSummary
-	summaryMutex        sync.RWMutex
-	oauth2Config        *oauth2.Config
-	userToken           *oauth2.Token
-	tokenMutex          sync.RWMutex
-	oauthState          string
-	currencyNameToID    map[string]int64
-	currencyCacheMutex  sync.RWMutex
+	config             Config
+	accountSummary     AccountSummary
+	summaryMutex       sync.RWMutex
+	oauth2Config       *oauth2.Config
+	userToken          *oauth2.Token
+	tokenMutex         sync.RWMutex
+	oauthState         string
+	currencyNameToID   map[string]int64
+	currencyCacheMutex sync.RWMutex
 )
 
 func main() {
@@ -112,6 +112,7 @@ func main() {
 		Port:         port,
 		RedirectURL:  fmt.Sprintf("http://localhost:%s/callback", port),
 	}
+	InitUILanguage(config.Locale, os.Getenv("UI_LOCALE"))
 
 	if config.ClientID == "" || config.ClientSecret == "" {
 		log.Fatal("BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET are required")
@@ -143,6 +144,7 @@ func main() {
 	http.HandleFunc("/login", handleLogin)
 	http.HandleFunc("/callback", handleCallback)
 	http.HandleFunc("/logout", handleLogout)
+	http.HandleFunc("/set-lang", handleSetLang)
 	http.HandleFunc("/refresh", handleRefresh)
 	http.HandleFunc("/vault", handleVault)
 	http.HandleFunc("/player-currency", handlePlayerCurrency)
@@ -952,28 +954,43 @@ func handlePlayerCurrency(w http.ResponseWriter, r *http.Request) {
 		CurrencyNames: namesByID,
 	}
 
+	lang := ResolveLanguage(r)
 	tmpl := template.Must(template.New("player-currency").Funcs(template.FuncMap{
 		"formatGold": formatGold,
 		"lower":      strings.ToLower,
 		"urlquery":   url.QueryEscape,
-	}).Parse(playerCurrencyTemplate))
+		"t":          func(k string) string { return T(lang, k) },
+		"tFmt":       func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":       func() string { return lang },
+	}).Parse(BuildPlayerCurrencyTemplate(lang, r.URL.RequestURI())))
 
 	if err := tmpl.Execute(w, view); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-// Simple player currency page template
-var playerCurrencyTemplate = `
-<html><head><title>Player Currency</title></head><body>
-<h1>Player Currency</h1>
-<p>This page displays selected currencies per-character (requires you to be logged in).</p>
+func BuildPlayerCurrencyTemplate(lang, currentPath string) string {
+	loginLink := fmt.Sprintf(`<a href="/login">%s</a>`, template.HTMLEscapeString(T(lang, "currency.login_link")))
+	loginMsg := fmt.Sprintf(T(lang, "currency.login_prompt"), loginLink)
+
+	return `<!DOCTYPE html>
+<html lang="` + lang + `"><head><meta charset="UTF-8"><title>` + template.HTMLEscapeString(T(lang, "currency.title")) + `</title>
+<style>
+.header-lang-selector { margin-bottom: 15px; display: inline-flex; align-items: center; gap: 6px; background: rgba(20,24,35,0.85); border: 1px solid #7d6a4d; border-radius: 4px; padding: 4px 10px; font-size: 0.85em; }
+.header-lang-selector .lang-btn { color: #9b8a6e; text-decoration: none; }
+.header-lang-selector .lang-btn.active { color: #ffe680; font-weight: bold; }
+.header-lang-selector .lang-sep { color: #5a4830; }
+</style>
+</head><body>
+` + string(LanguageSelectorHTML(lang, currentPath)) + `
+<h1>` + template.HTMLEscapeString(T(lang, "currency.title")) + `</h1>
+<p>` + template.HTMLEscapeString(T(lang, "currency.desc")) + `</p>
 {{if not .Account.Authenticated}}
-<p>Please <a href="/login">log in</a> to view per-character currencies.</p>
+<p>` + loginMsg + `</p>
 {{else}}
 <table border="1" cellpadding="6" cellspacing="0">
 <tr>
-    <th>Character</th>
+    <th>` + template.HTMLEscapeString(T(lang, "currency.th_character")) + `</th>
     {{- range $i, $cid := .CurrencyOrder}}
         <th>{{index $.CurrencyNames $cid}}</th>
     {{- end}}
@@ -986,13 +1003,16 @@ var playerCurrencyTemplate = `
                 <td>{{index .Currencies $cid}}</td>
             {{- end}}
         {{- else}}
-            <td colspan="{{len $.CurrencyOrder}}">No currency data (not authenticated or API error)</td>
+            <td colspan="{{len $.CurrencyOrder}}">` + template.HTMLEscapeString(T(lang, "currency.no_data")) + `</td>
         {{- end}}
     </tr>
 {{end}}
 </table>
 {{end}}
 </body></html>`
+}
+
+var playerCurrencyTemplate = BuildPlayerCurrencyTemplate(LangEn, "/player-currency")
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	// Check whether the stored token has expired; if so, clear it so the
@@ -1017,13 +1037,17 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 	data := accountSummary
 	summaryMutex.RUnlock()
 
+	lang := ResolveLanguage(r)
 	tmpl := template.Must(template.New("index").Funcs(template.FuncMap{
 		"formatGold":      formatGold,
-		"formatLastLogin": formatLastLogin,
+		"formatLastLogin": func(ts int64) string { return formatLastLoginWithLang(lang, ts) },
 		"getClassIcon":    getClassIcon,
 		"lower":           strings.ToLower,
 		"urlquery":        url.QueryEscape,
-	}).Parse(htmlTemplate))
+		"t":               func(k string) string { return T(lang, k) },
+		"tFmt":            func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":            func() string { return lang },
+	}).Parse(BuildHomeTemplate(lang, r.URL.RequestURI())))
 
 	if err := tmpl.Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1294,9 +1318,13 @@ func handleVault(w http.ResponseWriter, r *http.Request) {
 	summary := accountSummary
 	summaryMutex.RUnlock()
 
+	lang := ResolveLanguage(r)
 	tmpl, err := template.New("vault").Funcs(template.FuncMap{
 		"lower": strings.ToLower,
-	}).Parse(vaultTemplate)
+		"t":     func(k string) string { return T(lang, k) },
+		"tFmt":  func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":  func() string { return lang },
+	}).Parse(BuildVaultTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1312,9 +1340,13 @@ func handleRoster(w http.ResponseWriter, r *http.Request) {
 	summary := accountSummary
 	summaryMutex.RUnlock()
 
+	lang := ResolveLanguage(r)
 	tmpl, err := template.New("roster").Funcs(template.FuncMap{
 		"lower": strings.ToLower,
-	}).Parse(rosterTemplate)
+		"t":     func(k string) string { return T(lang, k) },
+		"tFmt":  func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":  func() string { return lang },
+	}).Parse(BuildRosterTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1330,9 +1362,13 @@ func handleProfessions(w http.ResponseWriter, r *http.Request) {
 	summary := accountSummary
 	summaryMutex.RUnlock()
 
+	lang := ResolveLanguage(r)
 	tmpl, err := template.New("professions").Funcs(template.FuncMap{
 		"lower": strings.ToLower,
-	}).Parse(professionsTemplate)
+		"t":     func(k string) string { return T(lang, k) },
+		"tFmt":  func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":  func() string { return lang },
+	}).Parse(BuildProfessionsTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1366,12 +1402,16 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	lang := ResolveLanguage(r)
 	tmpl, err := template.New("history").Funcs(template.FuncMap{
 		"json": func(v interface{}) (template.JS, error) {
 			b, err := json.Marshal(v)
 			return template.JS(b), err
 		},
-	}).Parse(historyTemplate)
+		"t":    func(k string) string { return T(lang, k) },
+		"tFmt": func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang": func() string { return lang },
+	}).Parse(BuildHistoryTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -1382,12 +1422,20 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var historyTemplate = `<!DOCTYPE html>
-<html lang="en">
+func BuildHistoryTemplate(lang, currentPath string) string {
+	dsTotalGold := template.JSEscapeString(T(lang, "history.ds_total_gold"))
+	dsMounts := template.JSEscapeString(T(lang, "history.ds_mounts"))
+	dsPets := template.JSEscapeString(T(lang, "history.ds_pets"))
+	dsIlvl := template.JSEscapeString(T(lang, "history.ds_ilvl"))
+	dsLevel := template.JSEscapeString(T(lang, "history.ds_level"))
+	dsGold := template.JSEscapeString(T(lang, "history.ds_gold"))
+
+	return `<!DOCTYPE html>
+<html lang="` + lang + `">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Progression History</title>
+    <title>` + template.HTMLEscapeString(T(lang, "history.page_title")) + `</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1533,67 +1581,65 @@ var historyTemplate = `<!DOCTYPE html>
             font-size: 0.8em; color: #9b8a6e; margin-bottom: 6px;
             text-align: center; letter-spacing: 0.5px; text-transform: uppercase;
         }
-`+navLayoutCSS+`
+` + navLayoutCSS + `
     </style>
 </head>
 <body>
 <div class="container">
 <header>
-    <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
+    <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="` + template.HTMLEscapeString(T(lang, "github.view")) + `">
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
     </a>
-    `+navHTML+`
+    ` + string(LanguageSelectorHTML(lang, currentPath)) + `
+    ` + NavHTML(lang) + `
     <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
 </header>
 </div>
 
 <div class="page-wrap">
     <div class="page-header">
-        <h1><img src="/images/progress.png" style="width:32px;height:32px;vertical-align:middle;margin-right:10px;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6));"> Progression History</h1>
-        <p>Gold &amp; item level trends over time</p>
+        <h1><img src="/images/progress.png" style="width:32px;height:32px;vertical-align:middle;margin-right:10px;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.6));"> ` + template.HTMLEscapeString(T(lang, "history.page_title")) + `</h1>
+        <p>` + template.HTMLEscapeString(T(lang, "history.subtitle")) + `</p>
     </div>
 
     {{if not .DBEnabled}}
     <div class="notice-box">
-        <h2>Database Not Configured</h2>
+        <h2>` + template.HTMLEscapeString(T(lang, "history.db_not_configured_title")) + `</h2>
         <p>
-            History tracking is optional. To enable it, add the following to your <code>.env</code> file
-            and restart the app:
+            ` + template.HTMLEscapeString(T(lang, "history.db_not_configured_p1")) + `
         </p>
         <p style="margin-top:14px;">
             <code>DATABASE_URL=postgres://user:password@host:5432/wow_stats</code>
         </p>
         <p style="margin-top:12px;">
-            The database schema will be created automatically on first startup.
-            Snapshots are saved every time you hit <strong>Refresh</strong> on the home page.
+            ` + template.HTMLEscapeString(T(lang, "history.db_not_configured_p2")) + `
         </p>
     </div>
     {{else}}
 
     {{if eq (len .AccountHistory.Labels) 0}}
     <div class="notice-box info">
-        <h2>No History Yet</h2>
+        <h2>` + template.HTMLEscapeString(T(lang, "history.no_history_title")) + `</h2>
         <p>
-            Database is connected! Snapshots are saved each time you refresh your character data
-            on the home page. Come back after a couple of refreshes to see your trends here.
+            ` + template.HTMLEscapeString(T(lang, "history.no_history_desc")) + `
         </p>
     </div>
     {{else}}
 
-    <div class="section-title">Account-wide</div>
+    <div class="section-title">` + template.HTMLEscapeString(T(lang, "history.account_wide")) + `</div>
 
     <div class="chart-card">
-        <h3>💰 Total Gold across all characters</h3>
+        <h3>` + template.HTMLEscapeString(T(lang, "history.chart_gold_title")) + `</h3>
         <div class="chart-wrap"><canvas id="chartGold"></canvas></div>
     </div>
 
     <div class="chart-card">
-        <h3>🐾 Collection Growth — Mounts &amp; Pets</h3>
+        <h3>` + template.HTMLEscapeString(T(lang, "history.chart_collections_title")) + `</h3>
         <div class="chart-wrap"><canvas id="chartCollections"></canvas></div>
     </div>
 
     {{if gt (len .CharHistories) 0}}
-    <div class="section-title">Per-Character Progression</div>
+    <div class="section-title">` + template.HTMLEscapeString(T(lang, "history.per_char")) + `</div>
         {{range $i, $c := .CharHistories}}
         <div class="char-card">
             <div class="char-card-header">
@@ -1601,15 +1647,15 @@ var historyTemplate = `<!DOCTYPE html>
             </div>
             <div class="char-charts">
                 <div class="char-chart-col">
-                    <div class="char-chart-label">⚔️ Item Level</div>
+                    <div class="char-chart-label">` + template.HTMLEscapeString(T(lang, "history.chart_ilvl")) + `</div>
                     <div class="char-chart-wrap"><canvas id="charIlvl{{$i}}"></canvas></div>
                 </div>
                 <div class="char-chart-col">
-                    <div class="char-chart-label">🎖️ Character Level</div>
+                    <div class="char-chart-label">` + template.HTMLEscapeString(T(lang, "history.chart_level")) + `</div>
                     <div class="char-chart-wrap"><canvas id="charLevel{{$i}}"></canvas></div>
                 </div>
                 <div class="char-chart-col">
-                    <div class="char-chart-label">💰 Gold</div>
+                    <div class="char-chart-label">` + template.HTMLEscapeString(T(lang, "history.chart_gold")) + `</div>
                     <div class="char-chart-wrap"><canvas id="charGold{{$i}}"></canvas></div>
                 </div>
             </div>
@@ -1661,7 +1707,7 @@ new Chart(document.getElementById('chartGold'), {
     type: 'line',
     data: {
         labels: GOLD_LABELS,
-        datasets: [{ label: 'Total Gold', data: GOLD_DATA,
+        datasets: [{ label: '` + dsTotalGold + `', data: GOLD_DATA,
             borderColor: '#f8c840', backgroundColor: 'rgba(248,200,64,0.08)',
             borderWidth: 2, pointRadius: 3, fill: true, tension: 0.3 }]
     },
@@ -1680,8 +1726,8 @@ new Chart(document.getElementById('chartCollections'), {
     data: {
         labels: GOLD_LABELS,
         datasets: [
-            { label: 'Mounts', data: MOUNTS_DATA, borderColor: '#c090ff', backgroundColor: 'rgba(192,144,255,0.08)', borderWidth: 2, pointRadius: 3, fill: true, tension: 0.3 },
-            { label: 'Pets',   data: PETS_DATA,   borderColor: '#80ffcc', backgroundColor: 'rgba(128,255,204,0.08)', borderWidth: 2, pointRadius: 3, fill: true, tension: 0.3 }
+            { label: '` + dsMounts + `', data: MOUNTS_DATA, borderColor: '#c090ff', backgroundColor: 'rgba(192,144,255,0.08)', borderWidth: 2, pointRadius: 3, fill: true, tension: 0.3 },
+            { label: '` + dsPets + `',   data: PETS_DATA,   borderColor: '#80ffcc', backgroundColor: 'rgba(128,255,204,0.08)', borderWidth: 2, pointRadius: 3, fill: true, tension: 0.3 }
         ]
     },
     options: chartDefaults
@@ -1692,7 +1738,7 @@ new Chart(document.getElementById('charIlvl{{$i}}'), {
     type: 'line',
     data: {
         labels: {{$c.Labels | json}},
-        datasets: [{ label: 'iLvl', data: {{$c.ItemLevel | json}},
+        datasets: [{ label: '` + dsIlvl + `', data: {{$c.ItemLevel | json}},
             borderColor: '#a0d0ff', backgroundColor: 'rgba(160,208,255,0.08)',
             borderWidth: 1.5, pointRadius: 2, fill: true, tension: 0.3 }]
     },
@@ -1708,7 +1754,7 @@ new Chart(document.getElementById('charLevel{{$i}}'), {
     type: 'line',
     data: {
         labels: {{$c.Labels | json}},
-        datasets: [{ label: 'Level', data: {{$c.Level | json}},
+        datasets: [{ label: '` + dsLevel + `', data: {{$c.Level | json}},
             borderColor: '#ffe680', backgroundColor: 'rgba(255,230,128,0.08)',
             borderWidth: 1.5, pointRadius: 2, fill: true, tension: 0.3,
             stepped: false }]
@@ -1725,7 +1771,7 @@ new Chart(document.getElementById('charGold{{$i}}'), {
     type: 'line',
     data: {
         labels: {{$c.Labels | json}},
-        datasets: [{ label: 'Gold', data: {{$c.Gold | json}},
+        datasets: [{ label: '` + dsGold + `', data: {{$c.Gold | json}},
             borderColor: '#f8c840', backgroundColor: 'rgba(248,200,64,0.08)',
             borderWidth: 1.5, pointRadius: 2, fill: true, tension: 0.3 }]
     },
@@ -1745,12 +1791,17 @@ new Chart(document.getElementById('charGold{{$i}}'), {
 </body>
 </html>
 `
-var professionsTemplate = `<!DOCTYPE html>
-<html lang="en">
+}
+
+var historyTemplate = BuildHistoryTemplate(LangEn, "/history")
+
+func BuildProfessionsTemplate(lang, currentPath string) string {
+	return `<!DOCTYPE html>
+<html lang="` + lang + `">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Profession Tracker</title>
+    <title>` + template.HTMLEscapeString(T(lang, "prof.title")) + `</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -2018,30 +2069,31 @@ var professionsTemplate = `<!DOCTYPE html>
 
         /* ── Character cards section (mobile fallback) ── */
         .section-hidden { display: none; }
-`+navLayoutCSS+`
-    </style>
+` + navLayoutCSS + `
+</style>
 </head>
 <body>
 <div class="container">
 <header>
-    <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
+    <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="` + template.HTMLEscapeString(T(lang, "github.view")) + `">
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
     </a>
-    `+navHTML+`
+    ` + string(LanguageSelectorHTML(lang, currentPath)) + `
+    ` + NavHTML(lang) + `
     <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
 </header>
 </div>
 
 <div class="page-wrap">
     <div class="page-title">
-        <img src="/images/professions.png" alt="" style="width:36px;height:36px;vertical-align:middle;margin-right:10px;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.6));">Profession Tracker
+        <img src="/images/professions.png" alt="" style="width:36px;height:36px;vertical-align:middle;margin-right:10px;filter:drop-shadow(0 2px 6px rgba(0,0,0,0.6));">` + template.HTMLEscapeString(T(lang, "prof.title")) + `
     </div>
-    <div class="page-subtitle">Primary &amp; secondary professions across your Warband</div>
+    <div class="page-subtitle">` + template.HTMLEscapeString(T(lang, "prof.subtitle")) + `</div>
 
     <div class="tabs" id="tabs">
-        <button class="tab-btn active" data-tab="primary">Primary Professions</button>
-        <button class="tab-btn" data-tab="secondary">Secondary Professions</button>
-        <button class="tab-btn" data-tab="all">All Tiers (History)</button>
+        <button class="tab-btn active" data-tab="primary">` + template.HTMLEscapeString(T(lang, "prof.tab_primary")) + `</button>
+        <button class="tab-btn" data-tab="secondary">` + template.HTMLEscapeString(T(lang, "prof.tab_secondary")) + `</button>
+        <button class="tab-btn" data-tab="all">` + template.HTMLEscapeString(T(lang, "prof.tab_all")) + `</button>
     </div>
 
     <!-- Character profession data embedded for JS -->
@@ -2060,7 +2112,7 @@ var professionsTemplate = `<!DOCTYPE html>
 
     <div class="matrix-wrap">
         <table id="prof-table">
-            <thead id="prof-thead"><tr><th>Character</th></tr></thead>
+            <thead id="prof-thead"><tr><th>` + template.HTMLEscapeString(T(lang, "prof.th_character")) + `</th></tr></thead>
             <tbody id="prof-tbody"></tbody>
         </table>
     </div>
@@ -2137,7 +2189,7 @@ var professionsTemplate = `<!DOCTYPE html>
         thead.innerHTML = '';
         const hr = document.createElement('tr');
         const thChar = document.createElement('th');
-        thChar.textContent = 'Character';
+        thChar.textContent = "` + template.JSEscapeString(T(lang, "prof.th_character")) + `";
         hr.appendChild(thChar);
         profNames.forEach(pn => {
             const th = document.createElement('th');
@@ -2268,7 +2320,7 @@ var professionsTemplate = `<!DOCTYPE html>
         } else {
             const txt = document.createElement('div');
             txt.className = 'skill-text';
-            txt.textContent = 'learned';
+            txt.textContent = "` + template.JSEscapeString(T(lang, "prof.learned")) + `";
             pill.appendChild(txt);
         }
 
@@ -2298,12 +2350,17 @@ var professionsTemplate = `<!DOCTYPE html>
 </body>
 </html>
 `
-var rosterTemplate = `<!DOCTYPE html>
-<html lang="en">
+}
+
+var professionsTemplate = BuildProfessionsTemplate(LangEn, "/professions")
+
+func BuildRosterTemplate(lang, currentPath string) string {
+	return `<!DOCTYPE html>
+<html lang="` + lang + `">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Weekly Reset Roster</title>
+    <title>` + template.HTMLEscapeString(T(lang, "roster.title")) + `</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -2652,16 +2709,17 @@ var rosterTemplate = `<!DOCTYPE html>
             padding: 40px;
             color: #9b8a6e;
         }
-`+navLayoutCSS+`
+` + navLayoutCSS + `
     </style>
 </head>
 <body>
 <div class="container">
     <header>
-        <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
+        <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="` + template.HTMLEscapeString(T(lang, "github.view")) + `">
             <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
         </a>
-        `+navHTML+`
+        ` + string(LanguageSelectorHTML(lang, currentPath)) + `
+        ` + NavHTML(lang) + `
         <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
     </header>
 </div>
@@ -2669,25 +2727,25 @@ var rosterTemplate = `<!DOCTYPE html>
 <div class="quick-links" style="max-width:1400px;margin:12px auto 0;padding:10px 20px;">
     <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
     {{range .Characters}}
-        <a class="char-action-btn" href="https://worldofwarcraft.blizzard.com/en-gb/character/eu/{{.Realm | urlquery}}/{{.Name | urlquery}}" target="_blank" rel="noopener">{{.Name}} Profile</a>
-        <a class="char-action-btn" href="https://simplearmory.com/#/eu/{{.Realm | urlquery}}/{{.Name | urlquery}}/achievements/dungeons" target="_blank" rel="noopener">{{.Name}} Dungeons</a>
+        <a class="char-action-btn" href="https://worldofwarcraft.blizzard.com/en-gb/character/eu/{{.Realm | urlquery}}/{{.Name | urlquery}}" target="_blank" rel="noopener">{{.Name}} ` + template.HTMLEscapeString(T(lang, "roster.profile_btn")) + `</a>
+        <a class="char-action-btn" href="https://simplearmory.com/#/eu/{{.Realm | urlquery}}/{{.Name | urlquery}}/achievements/dungeons" target="_blank" rel="noopener">{{.Name}} ` + template.HTMLEscapeString(T(lang, "roster.dungeons_btn")) + `</a>
     {{end}}
     </div>
 </div>
 
     <div class="page-header">
-        <img src="/images/quest.png" alt="Weekly Roster" class="roster-logo">
-        <h1>Weekly Reset Roster</h1>
-        <p>Track your weekly tasks — vault slots auto-complete when you drag characters in the Great Vault</p>
+        <img src="/images/quest.png" alt="` + template.HTMLEscapeString(T(lang, "roster.title")) + `" class="roster-logo">
+        <h1>` + template.HTMLEscapeString(T(lang, "roster.title")) + `</h1>
+        <p>` + template.HTMLEscapeString(T(lang, "roster.subtitle")) + `</p>
     </div>
 
     {{if not .Authenticated}}
     <div class="no-chars">
-        <p>Please <a href="/login" style="color:#ffe680;">log in</a> to use the roster.</p>
+        <p>` + fmt.Sprintf(T(lang, "roster.not_logged_in"), `<a href="/login" style="color:#ffe680;">`+template.HTMLEscapeString(T(lang, "currency.login_link"))+`</a>`) + `</p>
     </div>
     {{else if eq (len .Characters) 0}}
     <div class="no-chars">
-        <p>No character data yet — go back and wait for data to load.</p>
+        <p>` + template.HTMLEscapeString(T(lang, "roster.no_chars")) + `</p>
     </div>
     {{else}}
 
@@ -2706,18 +2764,18 @@ var rosterTemplate = `<!DOCTYPE html>
 
     <div class="quest-log" id="quest-log">
         <div class="quest-log-header">
-            <img src="/images/quest.png" alt="Quest" class="header-icon">
-            <h2>Weekly Objectives</h2>
-            <span class="reset-note">Resets every Tuesday</span>
+            <img src="/images/quest.png" alt="` + template.HTMLEscapeString(T(lang, "roster.objectives")) + `" class="header-icon">
+            <h2>` + template.HTMLEscapeString(T(lang, "roster.objectives")) + `</h2>
+            <span class="reset-note">` + template.HTMLEscapeString(T(lang, "roster.reset_note")) + `</span>
         </div>
 
         <!-- rows injected by JS -->
         <div id="roster-rows"></div>
 
         <div class="summary-bar">
-            <span>Characters fully done: <span class="summary-count" id="done-count">0</span></span>
-            <span>Total tracked: <span class="summary-count" id="total-count">0</span></span>
-            <button class="clear-roster-btn" id="clear-manual">🗑 Clear Manual Checks</button>
+            <span>` + template.HTMLEscapeString(T(lang, "roster.chars_done")) + ` <span class="summary-count" id="done-count">0</span></span>
+            <span>` + template.HTMLEscapeString(T(lang, "roster.total_tracked")) + ` <span class="summary-count" id="total-count">0</span></span>
+            <button class="clear-roster-btn" id="clear-manual">🗑 ` + template.HTMLEscapeString(T(lang, "roster.btn_reset_manual")) + `</button>
         </div>
     </div>
 
@@ -2730,38 +2788,38 @@ var rosterTemplate = `<!DOCTYPE html>
 
     // ── Vault slot → label + icon mapping ──
     const SLOTS = [
-        { key: 'raids-0',    icon: '/images/raid.png',    label: 'Vault: Raid Slot 1',    section: 'Raids' },
-        { key: 'raids-1',    icon: '/images/raid.png',    label: 'Vault: Raid Slot 2',    section: 'Raids' },
-        { key: 'raids-2',    icon: '/images/raid.png',    label: 'Vault: Raid Slot 3',    section: 'Raids' },
-        { key: 'dungeons-0', icon: '/images/dungeon.png', label: 'Vault: Dungeon Slot 1', section: 'Dungeons' },
-        { key: 'dungeons-1', icon: '/images/dungeon.png', label: 'Vault: Dungeon Slot 2', section: 'Dungeons' },
-        { key: 'dungeons-2', icon: '/images/dungeon.png', label: 'Vault: Dungeon Slot 3', section: 'Dungeons' },
-        { key: 'world-0',    icon: '/images/delve.png',   label: 'Vault: World Slot 1',   section: 'World' },
-        { key: 'world-1',    icon: '/images/delve.png',   label: 'Vault: World Slot 2',   section: 'World' },
-        { key: 'world-2',    icon: '/images/delve.png',   label: 'Vault: World Slot 3',   section: 'World' },
+        { key: 'raids-0',    icon: '/images/raid.png',    label: "` + template.JSEscapeString(T(lang, "roster.task_vault_raid_1")) + `",    section: "` + template.JSEscapeString(T(lang, "roster.sec_raids")) + `" },
+        { key: 'raids-1',    icon: '/images/raid.png',    label: "` + template.JSEscapeString(T(lang, "roster.task_vault_raid_2")) + `",    section: "` + template.JSEscapeString(T(lang, "roster.sec_raids")) + `" },
+        { key: 'raids-2',    icon: '/images/raid.png',    label: "` + template.JSEscapeString(T(lang, "roster.task_vault_raid_3")) + `",    section: "` + template.JSEscapeString(T(lang, "roster.sec_raids")) + `" },
+        { key: 'dungeons-0', icon: '/images/dungeon.png', label: "` + template.JSEscapeString(T(lang, "roster.task_vault_dungeon_1")) + `", section: "` + template.JSEscapeString(T(lang, "roster.sec_dungeons")) + `" },
+        { key: 'dungeons-1', icon: '/images/dungeon.png', label: "` + template.JSEscapeString(T(lang, "roster.task_vault_dungeon_2")) + `", section: "` + template.JSEscapeString(T(lang, "roster.sec_dungeons")) + `" },
+        { key: 'dungeons-2', icon: '/images/dungeon.png', label: "` + template.JSEscapeString(T(lang, "roster.task_vault_dungeon_3")) + `", section: "` + template.JSEscapeString(T(lang, "roster.sec_dungeons")) + `" },
+        { key: 'world-0',    icon: '/images/delve.png',   label: "` + template.JSEscapeString(T(lang, "roster.task_vault_world_1")) + `",   section: "` + template.JSEscapeString(T(lang, "roster.sec_world")) + `" },
+        { key: 'world-1',    icon: '/images/delve.png',   label: "` + template.JSEscapeString(T(lang, "roster.task_vault_world_2")) + `",   section: "` + template.JSEscapeString(T(lang, "roster.sec_world")) + `" },
+        { key: 'world-2',    icon: '/images/delve.png',   label: "` + template.JSEscapeString(T(lang, "roster.task_vault_world_3")) + `",   section: "` + template.JSEscapeString(T(lang, "roster.sec_world")) + `" },
     ];
 
     // Extra per-character manual tasks (not vault-linked)
     const MANUAL_TASKS = [
         // ── Vault ──
-        { key: 'open-vault',       icon: '/images/vault-button.png', label: 'Open your Vault',                                  section: 'Vault' },
+        { key: 'open-vault',       icon: '/images/vault-button.png', label: "` + template.JSEscapeString(T(lang, "roster.task_open_vault")) + `",       section: "` + template.JSEscapeString(T(lang, "roster.sec_vault")) + `" },
         // ── General ──
-        { key: 'world-event-quest',icon: '/images/quest.png',        label: 'World Event quest (Lady Liadrin — earn a Spark)',   section: 'General' },
-        { key: 'housing-quest',    icon: '/images/quest.png',        label: 'Housing weekly (Vaeli, outside Silvermoon bank)',   section: 'General' },
-        { key: 'world-boss',       icon: '/images/raid.png',         label: 'World Boss',                                       section: 'General' },
+        { key: 'world-event-quest',icon: '/images/quest.png',        label: "` + template.JSEscapeString(T(lang, "roster.task_world_event")) + `",     section: "` + template.JSEscapeString(T(lang, "roster.sec_general")) + `" },
+        { key: 'housing-quest',    icon: '/images/quest.png',        label: "` + template.JSEscapeString(T(lang, "roster.task_housing")) + `",         section: "` + template.JSEscapeString(T(lang, "roster.sec_general")) + `" },
+        { key: 'world-boss',       icon: '/images/raid.png',         label: "` + template.JSEscapeString(T(lang, "roster.task_world_boss")) + `",       section: "` + template.JSEscapeString(T(lang, "roster.sec_general")) + `" },
         // ── Raids ──
-        { key: 'lfr-4set',         icon: '/images/raid.png',         label: 'LFR — hunt for 4-set bonus',                       section: 'Raids' },
+        { key: 'lfr-4set',         icon: '/images/raid.png',         label: "` + template.JSEscapeString(T(lang, "roster.task_lfr_set")) + `",         section: "` + template.JSEscapeString(T(lang, "roster.sec_raids")) + `" },
         // ── Dungeons ──
-        { key: 'mplus-weekly',     icon: '/images/dungeon.png',      label: 'M+ keys — farm highest possible (up to +10)',      section: 'Dungeons' },
+        { key: 'mplus-weekly',     icon: '/images/dungeon.png',      label: "` + template.JSEscapeString(T(lang, "roster.task_mplus_weekly")) + `",     section: "` + template.JSEscapeString(T(lang, "roster.sec_dungeons")) + `" },
         // ── World / Prey ──
-        { key: 'prey-weekly',      icon: '/images/quest.png',        label: 'Nightmare Prey ×3 (weekly quest)',                 section: 'World' },
+        { key: 'prey-weekly',      icon: '/images/quest.png',        label: "` + template.JSEscapeString(T(lang, "roster.task_prey_weekly")) + `",      section: "` + template.JSEscapeString(T(lang, "roster.sec_world")) + `" },
         // ── Delves ──
-        { key: 'delve-t11',        icon: '/images/delve.png',        label: 'Delves — at least one T11',                        section: 'Delves' },
+        { key: 'delve-t11',        icon: '/images/delve.png',        label: "` + template.JSEscapeString(T(lang, "roster.task_delve_t11")) + `",       section: "` + template.JSEscapeString(T(lang, "roster.sec_delves")) + `" },
         // ── Currencies ──
-        { key: 'spend-crests',     icon: '/images/quest.png',        label: 'Spend Champion crests & below on upgrades',        section: 'Currencies' },
+        { key: 'spend-crests',     icon: '/images/quest.png',        label: "` + template.JSEscapeString(T(lang, "roster.task_spend_crests")) + `",    section: "` + template.JSEscapeString(T(lang, "roster.sec_currencies")) + `" },
         // ── Rotating / Optional ──
-        { key: 'timewalking-raid', icon: '/images/raid.png',         label: 'Timewalking raid quest (Hero-track reward)',        section: 'Optional' },
-        { key: 'timewalking-dung', icon: '/images/dungeon.png',      label: 'Timewalking dungeon quest (if active)',             section: 'Optional' },
+        { key: 'timewalking-raid', icon: '/images/raid.png',         label: "` + template.JSEscapeString(T(lang, "roster.task_tw_raid")) + `",        section: "` + template.JSEscapeString(T(lang, "roster.sec_optional")) + `" },
+        { key: 'timewalking-dung', icon: '/images/dungeon.png',      label: "` + template.JSEscapeString(T(lang, "roster.task_tw_dungeon")) + `",     section: "` + template.JSEscapeString(T(lang, "roster.sec_optional")) + `" },
     ];
 
     // ── Load data ──
@@ -2850,7 +2908,7 @@ var rosterTemplate = `<!DOCTYPE html>
             clsImg.alt = char.cls;
             clsImg.onerror = function() { this.style.display='none'; };
             metaEl.appendChild(clsImg);
-            metaEl.appendChild(document.createTextNode(char.realm + ' · ' + completedTasks + '/' + totalTasks + ' done'));
+            metaEl.appendChild(document.createTextNode(char.realm + ' · ' + completedTasks + '/' + totalTasks + ' ` + template.JSEscapeString(T(lang, "roster.done_suffix")) + `'));
             info.appendChild(metaEl);
 
             identity.appendChild(info);
@@ -2895,14 +2953,14 @@ var rosterTemplate = `<!DOCTYPE html>
                     if (task.done) {
                         const badge = document.createElement('span');
                         badge.className = 'task-vault-badge';
-                        badge.textContent = 'Vault ✓';
+                        badge.textContent = "` + template.JSEscapeString(T(lang, "roster.badge_vault")) + `";
                         item.appendChild(badge);
                     }
                 } else {
                     // Manual toggle button
                     const btn = document.createElement('button');
                     btn.className = 'task-mark-btn' + (task.done ? ' done-btn' : '');
-                    btn.textContent = task.done ? '✓ Done — undo?' : 'Mark done';
+                    btn.textContent = task.done ? "` + template.JSEscapeString(T(lang, "roster.btn_undo")) + `" : "` + template.JSEscapeString(T(lang, "roster.btn_mark_done")) + `";
                     btn.addEventListener('click', () => {
                         toggleManual(char.key, task.key);
                     });
@@ -2954,13 +3012,20 @@ var rosterTemplate = `<!DOCTYPE html>
 </body>
 </html>
 `
+}
 
-var vaultTemplate = `<!DOCTYPE html>
-<html lang="en">
+var rosterTemplate = BuildRosterTemplate(LangEn, "/roster")
+
+func BuildVaultTemplate(lang, currentPath string) string {
+	jsDropHint := template.JSEscapeString(T(lang, "vault.drop_hint"))
+	jsRemove := template.JSEscapeString(T(lang, "vault.remove_title"))
+
+	return `<!DOCTYPE html>
+<html lang="` + lang + `">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Great Vault Tracker</title>
+    <title>` + template.HTMLEscapeString(T(lang, "vault.page_title")) + `</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -3319,40 +3384,41 @@ var vaultTemplate = `<!DOCTYPE html>
             padding: 40px;
             color: #9b8a6e;
         }
-`+navLayoutCSS+`
+` + navLayoutCSS + `
     </style>
 </head>
 <body>
 <div class="container">
     <header>
-        <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
+        <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="` + template.HTMLEscapeString(T(lang, "github.view")) + `">
             <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
         </a>
-        `+navHTML+`
+        ` + string(LanguageSelectorHTML(lang, currentPath)) + `
+        ` + NavHTML(lang) + `
         <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
     </header>
 </div>
 
     <div class="page-header">
         <img src="/images/vault-button.png" alt="Great Vault" class="vault-logo">
-        <h1>Great Vault Tracker</h1>
-        <p>Drag characters onto slots to track your weekly Great Vault progress</p>
+        <h1>` + template.HTMLEscapeString(T(lang, "vault.page_title")) + `</h1>
+        <p>` + template.HTMLEscapeString(T(lang, "vault.subtitle")) + `</p>
     </div>
 
     {{if not .Authenticated}}
     <div class="no-chars">
-        <p>Please <a href="/login" style="color:#a060e0;">log in</a> to use the vault tracker.</p>
+        <p>` + fmt.Sprintf(T(lang, "vault.not_logged_in"), `<a href="/login" style="color:#a060e0;">`+template.HTMLEscapeString(T(lang, "currency.login_link"))+`</a>`) + `</p>
     </div>
     {{else if eq (len .Characters) 0}}
     <div class="no-chars">
-        <p>No character data yet — go back and wait for data to load.</p>
+        <p>` + template.HTMLEscapeString(T(lang, "vault.no_chars")) + `</p>
     </div>
     {{else}}
     <div class="vault-layout">
 
         <!-- CHARACTER ROSTER -->
         <div class="roster-panel">
-            <h3>Your Characters</h3>
+            <h3>` + template.HTMLEscapeString(T(lang, "vault.your_chars")) + `</h3>
             <div class="roster-list" id="roster">
                 {{range .Characters}}
              <div class="char-chip"
@@ -3382,20 +3448,20 @@ var vaultTemplate = `<!DOCTYPE html>
             <div class="vault-section">
                 <div class="section-header">
                     <img src="/images/raid.png" alt="Raids" class="section-icon-img">
-                    <span class="section-title">Raids</span>
+                    <span class="section-title">` + template.HTMLEscapeString(T(lang, "vault.section_raids")) + `</span>
                 </div>
                 <div class="slots-row">
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 1<br><span>Defeat 2 Midnight Season 1 Boss</span></div>
-                        <div class="drop-zone" data-slot="raids-0"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_1")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.raid_req_1")) + `</span></div>
+                        <div class="drop-zone" data-slot="raids-0"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 2<br><span>Defeat 4 Midnight Season 1 Boss</span></div>
-                        <div class="drop-zone" data-slot="raids-1"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_2")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.raid_req_2")) + `</span></div>
+                        <div class="drop-zone" data-slot="raids-1"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 3<br><span>Defeat 6 Midnight Season 1 Boss</span></div>
-                        <div class="drop-zone" data-slot="raids-2"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_3")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.raid_req_3")) + `</span></div>
+                        <div class="drop-zone" data-slot="raids-2"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                 </div>
             </div>
@@ -3404,20 +3470,20 @@ var vaultTemplate = `<!DOCTYPE html>
             <div class="vault-section">
                 <div class="section-header">
                     <img src="/images/dungeon.png" alt="Dungeons" class="section-icon-img">
-                    <span class="section-title">Dungeons</span>
+                    <span class="section-title">` + template.HTMLEscapeString(T(lang, "vault.section_dungeons")) + `</span>
                 </div>
                 <div class="slots-row">
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 1<br><span>Complete 1 Heroic, Mythic, or Timewalking Dungeon</span></div>
-                        <div class="drop-zone" data-slot="dungeons-0"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_1")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.dungeon_req_1")) + `</span></div>
+                        <div class="drop-zone" data-slot="dungeons-0"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 2<br><span>Complete 4 Heroic, Mythic, or Timewalking Dungeon</span></div>
-                        <div class="drop-zone" data-slot="dungeons-1"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_2")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.dungeon_req_2")) + `</span></div>
+                        <div class="drop-zone" data-slot="dungeons-1"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 3<br><span>Complete 8 Heroic, Mythic, or Timewalking Dungeon</span></div>
-                        <div class="drop-zone" data-slot="dungeons-2"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_3")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.dungeon_req_3")) + `</span></div>
+                        <div class="drop-zone" data-slot="dungeons-2"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                 </div>
             </div>
@@ -3426,25 +3492,25 @@ var vaultTemplate = `<!DOCTYPE html>
             <div class="vault-section">
                 <div class="section-header">
                     <img src="/images/delve.png" alt="World" class="section-icon-img">
-                    <span class="section-title">World (Delves / World Activities)</span>
+                    <span class="section-title">` + template.HTMLEscapeString(T(lang, "vault.section_world")) + `</span>
                 </div>
                 <div class="slots-row">
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 1<br><span>Complete 2 Delves or World Activities</span></div>
-                        <div class="drop-zone" data-slot="world-0"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_1")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.world_req_1")) + `</span></div>
+                        <div class="drop-zone" data-slot="world-0"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 2<br><span>Complete 4 Delves or World Activities</span></div>
-                        <div class="drop-zone" data-slot="world-1"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_2")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.world_req_2")) + `</span></div>
+                        <div class="drop-zone" data-slot="world-1"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                     <div class="vault-slot">
-                        <div class="slot-label">Slot 3<br><span>Complete 8 Delves or World Activities</span></div>
-                        <div class="drop-zone" data-slot="world-2"><span class="empty-hint">Drop character</span></div>
+                        <div class="slot-label">` + template.HTMLEscapeString(T(lang, "vault.slot_3")) + `<br><span>` + template.HTMLEscapeString(T(lang, "vault.world_req_3")) + `</span></div>
+                        <div class="drop-zone" data-slot="world-2"><span class="empty-hint">` + template.HTMLEscapeString(T(lang, "vault.drop_hint")) + `</span></div>
                     </div>
                 </div>
             </div>
 
-            <button class="clear-btn" id="clear-all">🗑 Clear All Slots</button>
+            <button class="clear-btn" id="clear-all">` + template.HTMLEscapeString(T(lang, "vault.clear_all")) + `</button>
         </div>
     </div>
     {{end}}
@@ -3537,7 +3603,7 @@ var vaultTemplate = `<!DOCTYPE html>
 
         const rm = document.createElement('button');
         rm.className = 'sc-remove';
-        rm.title = 'Remove';
+        rm.title = '` + jsRemove + `';
         rm.textContent = '✕';
         rm.addEventListener('click', () => {
             card.remove();
@@ -3553,7 +3619,7 @@ var vaultTemplate = `<!DOCTYPE html>
 
     function clearSlot(zone) {
         zone.classList.remove('filled');
-        zone.innerHTML = '<span class="empty-hint">Drop character</span>';
+        zone.innerHTML = '<span class="empty-hint">` + jsDropHint + `</span>';
     }
 
     // ── CLEAR ALL ──
@@ -3594,6 +3660,9 @@ var vaultTemplate = `<!DOCTYPE html>
 </body>
 </html>
 `
+}
+
+var vaultTemplate = BuildVaultTemplate(LangEn, "/vault")
 
 func formatGold(copper int64) string {
 	gold := copper / 10000
@@ -3616,12 +3685,11 @@ func formatWithCommas(n int64) string {
 	return formatWithCommas(n/1000) + "," + fmt.Sprintf("%03d", n%1000)
 }
 
-// formatLastLogin formats a unix timestamp to "X days ago" or "Just now"
-func formatLastLogin(timestamp int64) string {
+func formatLastLoginWithLang(lang string, timestamp int64) string {
 	if timestamp == 0 {
-		return "Unknown"
+		return T(lang, "home.time.unknown")
 	}
-	lastLogin := time.Unix(timestamp/1000, 0) // Convert milliseconds to seconds
+	lastLogin := time.Unix(timestamp/1000, 0)
 	duration := time.Since(lastLogin)
 
 	days := int(duration.Hours() / 24)
@@ -3631,32 +3699,37 @@ func formatLastLogin(timestamp int64) string {
 	if days > 365 {
 		years := days / 365
 		if years == 1 {
-			return "1 year ago"
+			return T(lang, "home.time.year_ago")
 		}
-		return fmt.Sprintf("%d years ago", years)
+		return TFmt(lang, "home.time.years_ago", years)
 	} else if days > 30 {
 		months := days / 30
 		if months == 1 {
-			return "1 month ago"
+			return T(lang, "home.time.month_ago")
 		}
-		return fmt.Sprintf("%d months ago", months)
+		return TFmt(lang, "home.time.months_ago", months)
 	} else if days > 0 {
 		if days == 1 {
-			return "Yesterday"
+			return T(lang, "home.time.yesterday")
 		}
-		return fmt.Sprintf("%d days ago", days)
+		return TFmt(lang, "home.time.days_ago", days)
 	} else if hours > 0 {
 		if hours == 1 {
-			return "1 hour ago"
+			return T(lang, "home.time.hour_ago")
 		}
-		return fmt.Sprintf("%d hours ago", hours)
+		return TFmt(lang, "home.time.hours_ago", hours)
 	} else if minutes > 0 {
 		if minutes == 1 {
-			return "1 minute ago"
+			return T(lang, "home.time.minute_ago")
 		}
-		return fmt.Sprintf("%d minutes ago", minutes)
+		return TFmt(lang, "home.time.minutes_ago", minutes)
 	}
-	return "Just now"
+	return T(lang, "home.time.just_now")
+}
+
+// formatLastLogin formats a unix timestamp to "X days ago" or "Just now" (English fallback)
+func formatLastLogin(timestamp int64) string {
+	return formatLastLoginWithLang(LangEn, timestamp)
 }
 
 // getClassIcon returns the icon filename for a given class
@@ -3692,13 +3765,15 @@ func getEnvOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-const htmlTemplate = `
-<!DOCTYPE html>
-<html lang="en">
+func BuildHomeTemplate(lang, currentPath string) string {
+	jsBannerMsg := template.JSEscapeString(T(lang, "home.refresh_banner"))
+
+	return `<!DOCTYPE html>
+<html lang="` + lang + `">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WoW Character Stats</title>
+    <title>` + template.HTMLEscapeString(T(lang, "home.title")) + `</title>
     <style>
         * {
             margin: 0;
@@ -4197,7 +4272,7 @@ const htmlTemplate = `
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-`+navLayoutCSS+`
+` + navLayoutCSS + `
     </style>
     <script>
         // Auto-refresh if authenticated but no character data loaded yet
@@ -4214,7 +4289,7 @@ const htmlTemplate = `
                 const banner = document.createElement('div');
                 banner.id = 'refresh-banner';
                 banner.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#1a3a1a;color:#6ee7b7;text-align:center;padding:10px;font-size:0.95em;z-index:9999;border-bottom:1px solid #2d5a2d;';
-                banner.textContent = '⏳ Fetching latest data from Battle.net… page will update automatically.';
+                banner.textContent = '` + jsBannerMsg + `';
                 document.body.prepend(banner);
 
                 const lastUpdate = '{{.LastUpdate}}';
@@ -4246,38 +4321,39 @@ const htmlTemplate = `
 <body>
     <div class="container">
         <header>
-            <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="View on GitHub">
+            <a href="https://github.com/MichaelCade/wow_stats" target="_blank" rel="noopener" class="github-link" title="` + template.HTMLEscapeString(T(lang, "github.view")) + `">
                 <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
             </a>
+            ` + string(LanguageSelectorHTML(lang, currentPath)) + `
             {{if .Authenticated}}
-            `+navHTML+`
+            ` + NavHTML(lang) + `
             {{end}}
             <img src="/images/World-of-Warcraft-Logo-2001.png" alt="World of Warcraft" class="logo">
             {{if .Authenticated}}
-            <div class="last-update">Last Updated: {{.LastUpdate.Format "Jan 02, 2006 15:04:05 MST"}}</div>
+            <div class="last-update">` + fmt.Sprintf(T(lang, "home.last_updated"), `{{.LastUpdate.Format "Jan 02, 2006 15:04:05 MST"}}`) + `</div>
             {{end}}
         </header>
 
         {{if not .Authenticated}}
         <div class="login-prompt">
-            <h2>Welcome to WoW Stats Tracker!</h2>
-            <p>Please login with your Battle.net account to view your characters.</p>
+            <h2>` + template.HTMLEscapeString(T(lang, "home.welcome_title")) + `</h2>
+            <p>` + template.HTMLEscapeString(T(lang, "home.welcome_desc")) + `</p>
             <br>
-            <a href="/login" class="btn btn-primary">🔐 Login with Battle.net</a>
+            <a href="/login" class="btn btn-primary">` + template.HTMLEscapeString(T(lang, "home.login_btn")) + `</a>
         </div>
         {{else}}
         {{if eq (len .Characters) 0}}
         <div class="loading-message">
             <div class="spinner"></div>
-            <p>Loading your character data from Battle.net...</p>
-            <p style="opacity: 0.7; margin-top: 10px;">This page will refresh automatically.</p>
+            <p>` + template.HTMLEscapeString(T(lang, "home.loading_chars")) + `</p>
+            <p style="opacity: 0.7; margin-top: 10px;">` + template.HTMLEscapeString(T(lang, "home.loading_auto_refresh")) + `</p>
         </div>
         {{else}}
         <div class="summary">
             <div class="summary-grid">
                 <div class="summary-stat">
                     <div class="summary-stat-label">
-                        <img src="/images/gold.png" alt="Gold"> Total Account Gold
+                        <img src="/images/gold.png" alt="Gold"> ` + template.HTMLEscapeString(T(lang, "home.total_gold")) + `
                     </div>
                     <div class="summary-stat-value gold">{{formatGold .TotalGold}}</div>
                 </div>
@@ -4285,7 +4361,7 @@ const htmlTemplate = `
                 <div class="summary-divider"></div>
                 <div class="summary-stat">
                     <div class="summary-stat-label">
-                        <img src="/images/mount.png" alt="Mounts"> Mounts Collected
+                        <img src="/images/mount.png" alt="Mounts"> ` + template.HTMLEscapeString(T(lang, "home.mounts_collected")) + `
                     </div>
                     <div class="summary-stat-value mounts">{{.MountsCollected}}</div>
                 </div>
@@ -4294,7 +4370,7 @@ const htmlTemplate = `
                 <div class="summary-divider"></div>
                 <div class="summary-stat">
                     <div class="summary-stat-label">
-                        <img src="/images/pet.png" alt="Pets"> Pets Collected
+                        <img src="/images/pet.png" alt="Pets"> ` + template.HTMLEscapeString(T(lang, "home.pets_collected")) + `
                     </div>
                     <div class="summary-stat-value pets">{{.PetsCollected}}</div>
                 </div>
@@ -4302,19 +4378,19 @@ const htmlTemplate = `
                 {{if or .HordeCount .AllianceCount}}
                 <div class="summary-divider"></div>
                 <div class="summary-stat">
-                    <div class="summary-stat-label" style="margin-bottom: 10px;">Characters by Faction</div>
+                    <div class="summary-stat-label" style="margin-bottom: 10px;">` + template.HTMLEscapeString(T(lang, "home.chars_by_faction")) + `</div>
                     <div class="faction-counts">
                         {{if .AllianceCount}}
                         <div class="faction-count-row">
                             <img src="/images/wow-alliance.png" alt="Alliance">
-                            <span class="faction-count-label">Alliance</span>
+                            <span class="faction-count-label">` + template.HTMLEscapeString(T(lang, "home.faction_alliance")) + `</span>
                             <span class="faction-count-value alliance">{{.AllianceCount}}</span>
                         </div>
                         {{end}}
                         {{if .HordeCount}}
                         <div class="faction-count-row">
                             <img src="/images/wow-horde.png" alt="Horde">
-                            <span class="faction-count-label">Horde</span>
+                            <span class="faction-count-label">` + template.HTMLEscapeString(T(lang, "home.faction_horde")) + `</span>
                             <span class="faction-count-value horde">{{.HordeCount}}</span>
                         </div>
                         {{end}}
@@ -4340,12 +4416,12 @@ const htmlTemplate = `
                 {{if eq .Faction "ALLIANCE"}}
                 <div class="faction-badge faction-alliance">
                     <img src="/images/wow-alliance.png" alt="Alliance" class="faction-logo">
-                    Alliance
+                    ` + template.HTMLEscapeString(T(lang, "home.faction_alliance")) + `
                 </div>
                 {{else if eq .Faction "HORDE"}}
                 <div class="faction-badge faction-horde">
                     <img src="/images/wow-horde.png" alt="Horde" class="faction-logo">
-                    Horde
+                    ` + template.HTMLEscapeString(T(lang, "home.faction_horde")) + `
                 </div>
                 {{end}}
                 {{if .Class}}
@@ -4357,12 +4433,12 @@ const htmlTemplate = `
                 </div>
                 {{end}}
                 <div class="stat-row">
-                    <span class="stat-label">Level:</span>
+                    <span class="stat-label">` + template.HTMLEscapeString(T(lang, "home.stat_level")) + `</span>
                     <span class="stat-value">{{.Level}}</span>
                 </div>
                 <div class="stub-notice">
                     <span class="stub-icon">🌱</span>
-                    <span class="stub-text">Below level 10 — limited profile data</span>
+                    <span class="stub-text">` + template.HTMLEscapeString(T(lang, "home.below_level_10")) + `</span>
                 </div>
             </div>
             {{else}}
@@ -4386,12 +4462,12 @@ const htmlTemplate = `
                     {{if eq .Faction "ALLIANCE"}}
                     <div class="faction-badge faction-alliance">
                         <img src="/images/wow-alliance.png" alt="Alliance" class="faction-logo">
-                        Alliance
+                        ` + template.HTMLEscapeString(T(lang, "home.faction_alliance")) + `
                     </div>
                     {{else if eq .Faction "HORDE"}}
                     <div class="faction-badge faction-horde">
                         <img src="/images/wow-horde.png" alt="Horde" class="faction-logo">
-                        Horde
+                        ` + template.HTMLEscapeString(T(lang, "home.faction_horde")) + `
                     </div>
                     {{end}}
                     <div class="race-class-info">
@@ -4407,26 +4483,26 @@ const htmlTemplate = `
                     <div class="error-message">❌ {{.Error}}</div>
                 {{else}}
                     <div class="stat-row">
-                        <span class="stat-label">Level:</span>
+                        <span class="stat-label">` + template.HTMLEscapeString(T(lang, "home.stat_level")) + `</span>
                         <span class="stat-value">{{.Level}}</span>
                     </div>
                     <div class="stat-row">
-                        <span class="stat-label">Item Level:</span>
+                        <span class="stat-label">` + template.HTMLEscapeString(T(lang, "home.stat_item_level")) + `</span>
                         <span class="stat-value">{{.ItemLevel}}</span>
                     </div>
                     <div class="stat-row">
-                        <span class="stat-label">Gold:</span>
+                        <span class="stat-label">` + template.HTMLEscapeString(T(lang, "home.stat_gold")) + `</span>
                         <span class="stat-value gold-value">{{formatGold .Gold}}</span>
                     </div>
                     {{if .LastLogin}}
                     <div class="stat-row">
-                        <span class="stat-label">Last Played:</span>
+                        <span class="stat-label">` + template.HTMLEscapeString(T(lang, "home.stat_last_played")) + `</span>
                         <span class="stat-value">{{formatLastLogin .LastLogin}}</span>
                     </div>
                     {{end}}
                     {{if .LastRaidKill}}
                     <div class="stat-row">
-                        <span class="stat-label">Last Raid Kill:</span>
+                        <span class="stat-label">` + template.HTMLEscapeString(T(lang, "home.stat_last_raid_kill")) + `</span>
                         <span class="stat-value raid-kill">{{.LastRaidKill}}</span>
                     </div>
                     <div class="stat-row">
@@ -4436,14 +4512,14 @@ const htmlTemplate = `
                     {{end}}
                     {{if .Professions}}
                     <div class="professions-list">
-                        <strong>Professions:</strong><br>
+                        <strong>` + template.HTMLEscapeString(T(lang, "home.professions_label")) + `</strong><br>
                         {{range .Professions}}
                         <div class="profession-item">• {{.Name}} {{with .CurrentTier}}{{if .Max}}({{.Skill}}/{{.Max}}){{end}}{{end}}</div>
                         {{end}}
                     </div>
                     {{else}}
                     <div class="professions-list">
-                        <div class="profession-none">No professions selected</div>
+                        <div class="profession-none">` + template.HTMLEscapeString(T(lang, "home.no_professions")) + `</div>
                     </div>
                     {{end}}
                 {{end}}
@@ -4454,10 +4530,10 @@ const htmlTemplate = `
 
         <div class="controls">
             <form action="/refresh" method="POST" style="display: inline;">
-                <button type="submit" class="btn" id="refresh-btn">🔄 Refresh Data</button>
+                <button type="submit" class="btn" id="refresh-btn">` + template.HTMLEscapeString(T(lang, "home.btn_refresh")) + `</button>
             </form>
             <div class="refresh-note">
-                💡 Data only updates after you <strong>log out</strong> of a character in-game — Blizzard's API reflects the last logout state.
+                ` + template.HTMLEscapeString(T(lang, "home.refresh_note")) + `
             </div>
         </div>
         {{end}}
@@ -4466,3 +4542,6 @@ const htmlTemplate = `
 </body>
 </html>
 `
+}
+
+var htmlTemplate = BuildHomeTemplate(LangEn, "/")

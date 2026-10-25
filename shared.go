@@ -142,8 +142,21 @@ const navHTML = `<div class="header-nav-btns">
 // logo (instead of a column pinned top-left that overlapped page content).
 // It is appended after each page's own CSS so it overrides the old rules.
 const navLayoutCSS = `
+/* ── Language Selector ── */
+.header-lang-selector {
+  position: absolute; top: 12px; left: 12px; display: inline-flex; align-items: center; gap: 6px;
+  background: rgba(20,24,35,0.85); border: 1px solid #7d6a4d; border-radius: 4px; padding: 4px 10px;
+  font-size: 0.82em; z-index: 10;
+}
+.header-lang-selector .lang-btn {
+  color: #9b8a6e; text-decoration: none; font-weight: normal; transition: color .15s;
+}
+.header-lang-selector .lang-btn:hover { color: #f8e6c8; }
+.header-lang-selector .lang-btn.active { color: #ffe680; font-weight: bold; text-shadow: 0 0 4px rgba(255,230,128,0.5); }
+.header-lang-selector .lang-sep { color: #5a4830; }
+
 /* ── Horizontal header nav (overrides legacy top-left column) ── */
-header { display: flex !important; flex-direction: column; align-items: center; }
+header { display: flex !important; flex-direction: column; align-items: center; position: relative; }
 header .logo { order: 1; }
 header .header-nav-btns {
   order: 2; position: static !important; flex-direction: row !important; flex-wrap: wrap;

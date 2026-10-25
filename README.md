@@ -57,6 +57,8 @@ A self-hosted World of Warcraft character dashboard that uses the official Battl
 - **Configurable scope** — Expansion category name(s) and the 80% threshold live in `data/achievement_scope.json`
 
 ### 🌐 General
+- **Traditional Chinese (zh-TW) & English UI Support** — Full interface translation using Taiwan WoW terminology (宏偉寶庫, 聯盟, 部落, 專業技能, etc.)
+- **Persistent Language Selector** — Switch between English and 繁體中文 on every page (persists via `ui_lang` cookie across reloads and navigation)
 - **Battle.net OAuth2** — Secure login; no passwords stored
 - **Parallel API fetching** — All character data fetched concurrently for fast load times
 - **Auto-refresh** — Page polls until character data is ready after first login
@@ -116,6 +118,17 @@ go run .
 ```
 
 OAuth uses global endpoints (`oauth.battle.net`), while `REGION` selects game data.
+
+### Language & Localization (UI_LOCALE vs LOCALE)
+
+- **UI Language (`UI_LOCALE` / `ui_lang` cookie)**: Controls interface text, titles, navigation, button labels, and status messages.
+  - Users can switch language at any time via the language selector (`English` / `繁體中文`) at the top-left of every page. The choice is stored in a `ui_lang` cookie (`en` or `zh-TW`).
+  - Default UI language resolution:
+    1. If `UI_LOCALE` is explicitly set in `.env` (e.g. `UI_LOCALE=zh-TW` or `UI_LOCALE=en`), it overrides the server default.
+    2. If `UI_LOCALE` is unset, the UI defaults to `zh-TW` whenever Blizzard API `LOCALE=zh_TW`. Otherwise, it defaults to English (`en`).
+- **Blizzard API Game Data (`REGION` & `LOCALE`)**:
+  - `LOCALE` (e.g. `en_GB`, `en_US`, `zh_TW`) controls the language returned by the Blizzard API for in-game names (item names, realm names, spell and currency names).
+  - Setting `REGION=tw` and `LOCALE=zh_TW` configures the app to query Taiwan Blizzard servers and fetch game entities directly in Traditional Chinese.
 
 ### Option B: Docker Compose
 
