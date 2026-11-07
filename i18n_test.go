@@ -367,7 +367,41 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 	oauth2Config = &oauth2.Config{}
 	tokenMutex.Unlock()
 
+	i18nSess := globalSessions.Create()
+	i18nSess.mu.Lock()
+	i18nSess.Token = &oauth2.Token{AccessToken: "fake-test-token", Expiry: time.Now().Add(24 * time.Hour)}
+	i18nSess.Authenticated = true
+	i18nSess.Summary = summary
+	i18nSess.AccountID = "test-i18n-account"
+	i18nSess.mu.Unlock()
+
+	eqState.Lock()
+	i18nSess.Equipment.Lock()
+	i18nSess.Equipment.Data = eqState.data
+	i18nSess.Equipment.Fetched = eqState.fetched
+	i18nSess.Equipment.Loading = false
+	i18nSess.Equipment.Unlock()
+	eqState.Unlock()
+
+	mpState.Lock()
+	i18nSess.MythicPlus.Lock()
+	i18nSess.MythicPlus.Data = mpState.data
+	i18nSess.MythicPlus.Fetched = mpState.fetched
+	i18nSess.MythicPlus.Loading = false
+	i18nSess.MythicPlus.Unlock()
+	mpState.Unlock()
+
+	achProfiles.Lock()
+	i18nSess.AchievementsMu.Lock()
+	for k, v := range achProfiles.m {
+		i18nSess.Achievements[k] = v
+	}
+	i18nSess.AchievementsMu.Unlock()
+	achProfiles.Unlock()
+
 	t.Cleanup(func() {
+		globalSessions.Delete(i18nSess.ID)
+
 		summaryMutex.Lock()
 		accountSummary = AccountSummary{}
 		summaryMutex.Unlock()
@@ -522,10 +556,12 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 	for _, l := range languages {
 		t.Run("Pages_"+l.code, func(t *testing.T) {
 			cookie := &http.Cookie{Name: cookieName, Value: l.code}
+			authCookie := &http.Cookie{Name: SessionCookieName, Value: i18nSess.ID}
 
 			// 1. Home Page (Authenticated)
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr := httptest.NewRecorder()
 			handleHome(rr, req)
 			body := rr.Body.String()
@@ -585,6 +621,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 3. Vault Page
 			req = httptest.NewRequest(http.MethodGet, "/vault", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleVault(rr, req)
 			body = rr.Body.String()
@@ -608,6 +645,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 4. Roster Page
 			req = httptest.NewRequest(http.MethodGet, "/roster", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleRoster(rr, req)
 			body = rr.Body.String()
@@ -628,6 +666,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 5. Professions Page
 			req = httptest.NewRequest(http.MethodGet, "/professions", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleProfessions(rr, req)
 			body = rr.Body.String()
@@ -648,6 +687,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 6. History Page
 			req = httptest.NewRequest(http.MethodGet, "/history", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleHistory(rr, req)
 			body = rr.Body.String()
@@ -668,6 +708,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 7. Player Currency Page
 			req = httptest.NewRequest(http.MethodGet, "/player-currency", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handlePlayerCurrency(rr, req)
 			body = rr.Body.String()
@@ -681,6 +722,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 8. Mythic+ Page
 			req = httptest.NewRequest(http.MethodGet, "/mythic-plus", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleMythicPlus(rr, req)
 			body = rr.Body.String()
@@ -710,6 +752,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 9. Equipment Page
 			req = httptest.NewRequest(http.MethodGet, "/equipment", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleEquipment(rr, req)
 			body = rr.Body.String()
@@ -745,6 +788,7 @@ func TestPageTemplatesRenderEnglishAndZhTW(t *testing.T) {
 			// 10. Achievements Page
 			req = httptest.NewRequest(http.MethodGet, "/achievements?c=arthas<script>alert(1)</script>-silvermoon", nil)
 			req.AddCookie(cookie)
+			req.AddCookie(authCookie)
 			rr = httptest.NewRecorder()
 			handleAchievements(rr, req)
 			body = rr.Body.String()

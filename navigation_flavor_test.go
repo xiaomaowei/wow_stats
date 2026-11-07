@@ -5,6 +5,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/oauth2"
 )
 
 func TestNavigationFlavor(t *testing.T) {
@@ -156,6 +159,14 @@ func TestNavigationFlavorHomeIntegration(t *testing.T) {
 		summaryMutex.Unlock()
 	}()
 
+	testSess := globalSessions.Create()
+	testSess.mu.Lock()
+	testSess.Authenticated = true
+	testSess.Token = &oauth2.Token{AccessToken: "fake-token", Expiry: time.Now().Add(time.Hour)}
+	testSess.Summary = AccountSummary{Authenticated: true}
+	testSess.mu.Unlock()
+	defer globalSessions.Delete(testSess.ID)
+
 	for _, gv := range []string{"retail", "forever"} {
 		t.Run("Home_"+gv, func(t *testing.T) {
 			config = Config{
@@ -164,6 +175,7 @@ func TestNavigationFlavorHomeIntegration(t *testing.T) {
 
 			for _, lang := range []string{LangEn, LangZhTW} {
 				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: testSess.ID})
 				req.AddCookie(&http.Cookie{Name: "lang", Value: lang})
 				rr := httptest.NewRecorder()
 				handleHome(rr, req)

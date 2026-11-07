@@ -5,5 +5,27 @@ services:
       - "8081:8081"
     env_file:
       - .env
+    environment:
+      - PORT=8081
+      # Optional: Public callback URL for reverse proxy / production HTTPS deployment
+      # Defaults to http://localhost:${PORT:-8081}/callback if unset
+      # - REDIRECT_URL=https://your-domain.com/callback
+      # Optional: PostgreSQL persistence connection string
+      # - DATABASE_URL=postgres://wow:secret@db:5432/wow_stats?sslmode=disable
     restart: unless-stopped
     container_name: wow_stats
+
+  # Optional PostgreSQL service for account-scoped history tracking
+  # Uncomment if database persistence is desired:
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: wow
+  #     POSTGRES_PASSWORD: secret
+  #     POSTGRES_DB: wow_stats
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+# volumes:
+#   postgres_data:

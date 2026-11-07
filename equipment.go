@@ -36,15 +36,15 @@ type EquippedItem struct {
 	Ilvl           int
 	Quality        string // lowercase quality type: epic, rare, ...
 	Icon           string
-	SlotName       string // localized slot name or raw slot
-	InventoryType  string // e.g. "One-Hand", "Head", etc.
-	ItemSubclass   string // e.g. "Cloth", "Sword", etc.
-	Binding        string // e.g. "Binds when picked up"
-	UniqueEquipped string // e.g. "Unique-Equipped"
-	ArmorDisplay   string // e.g. "120 Armor"
-	WeaponDamage   string // e.g. "150 - 280 Damage"
-	WeaponSpeed    string // e.g. "Speed 2.60"
-	WeaponDPS      string // e.g. "(81.3 damage per second)"
+	SlotName       string   // localized slot name or raw slot
+	InventoryType  string   // e.g. "One-Hand", "Head", etc.
+	ItemSubclass   string   // e.g. "Cloth", "Sword", etc.
+	Binding        string   // e.g. "Binds when picked up"
+	UniqueEquipped string   // e.g. "Unique-Equipped"
+	ArmorDisplay   string   // e.g. "120 Armor"
+	WeaponDamage   string   // e.g. "150 - 280 Damage"
+	WeaponSpeed    string   // e.g. "Speed 2.60"
+	WeaponDPS      string   // e.g. "(81.3 damage per second)"
 	Stats          []string // e.g. ["+81 Intellect", "+25 Stamina"]
 	Spells         []string // e.g. ["Equip: Increases critical strike by 25."]
 	Requirements   []string // e.g. ["Requires Level 70", "Classes: Druid"]
@@ -485,38 +485,71 @@ func parseGearStats(st map[string]interface{}) GearStats {
 	return g
 }
 
-func fetchAllEquipment() {
+func fetchAllEquipmentForSession(session *UserSession) {
+	if session == nil || session.IsRevoked() {
+		return
+	}
 	defer func() {
-		eqState.Lock()
-		eqState.loading = false
-		eqState.Unlock()
+		session.Equipment.Lock()
+		session.Equipment.Loading = false
+		session.Equipment.Unlock()
 	}()
-	client := apiClient()
+	ctx := session.Context()
+	client := session.Client(ctx)
 	if client == nil {
 		return
 	}
 	rules := loadGearRules()
-	chars := eligibleCharacters(10)
+	chars := session.EligibleCharacters(10)
 
 	results := make([]EQChar, len(chars))
 	sem := make(chan struct{}, 5)
 	var wg sync.WaitGroup
 	for i, c := range chars {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		wg.Add(1)
 		go func(i int, c CharacterStats) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
+			if session.IsRevoked() || ctx.Err() != nil {
+				return
+			}
 			results[i] = fetchEquipment(client, c, rules)
 		}(i, c)
 	}
 	wg.Wait()
 
-	eqState.Lock()
-	eqState.data = results
-	eqState.fetched = time.Now()
-	eqState.Unlock()
+	if session.IsRevoked() || ctx.Err() != nil {
+		return
+	}
+
+	session.Equipment.Lock()
+	if !session.IsRevoked() && ctx.Err() == nil {
+		session.Equipment.Data = results
+		session.Equipment.Fetched = time.Now()
+	}
+	session.Equipment.Unlock()
 	log.Printf("Equipment fetched for %d characters", len(results))
+}
+
+func fetchAllEquipment() {
+	legacy := getLegacySession()
+	fetchAllEquipmentForSession(legacy)
+	legacy.Equipment.RLock()
+	data := legacy.Equipment.Data
+	fetched := legacy.Equipment.Fetched
+	legacy.Equipment.RUnlock()
+	eqState.Lock()
+	eqState.data = data
+	eqState.fetched = fetched
+	eqState.Unlock()
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
@@ -546,26 +579,44 @@ func slotViews(c *EQChar, lang string, types ...string) []SlotView {
 }
 
 func handleEquipment(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("refresh") == "1" {
-		clearExtraCaches()
-		http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if apiClient() == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Redirect(w, r, "/", http.StatusSeeOther) // home shows the Battle.net login screen
 		return
 	}
 
-	eqState.Lock()
-	stale := eqState.fetched.IsZero() || time.Since(eqState.fetched) > cacheTTL
-	if stale && !eqState.loading {
-		eqState.loading = true
-		go fetchAllEquipment()
+	if r.URL.Query().Get("refresh") == "1" {
+		session.Equipment.Lock()
+		session.Equipment.Fetched = time.Time{}
+		session.Equipment.Unlock()
+		if session == legacySession {
+			clearExtraCaches()
+		}
+		http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
+		return
 	}
-	data := eqState.data
-	fetched := eqState.fetched
-	eqState.Unlock()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Legacy bridge for tests that populate global eqState directly
+	if session == legacySession {
+		eqState.Lock()
+		session.Equipment.Lock()
+		session.Equipment.Data = eqState.data
+		session.Equipment.Fetched = eqState.fetched
+		session.Equipment.Loading = eqState.loading
+		session.Equipment.Unlock()
+		eqState.Unlock()
+	}
+
+	session.Equipment.Lock()
+	stale := session.Equipment.Fetched.IsZero() || time.Since(session.Equipment.Fetched) > cacheTTL
+	if stale && !session.Equipment.Loading {
+		session.Equipment.Loading = true
+		go fetchAllEquipmentForSession(session)
+	}
+	data := session.Equipment.Data
+	fetched := session.Equipment.Fetched
+	session.Equipment.Unlock()
 
 	page := EQPageData{Loading: fetched.IsZero(), Chars: data}
 	if !page.Loading && len(data) > 0 {
@@ -594,10 +645,10 @@ func handleEquipment(w http.ResponseWriter, r *http.Request) {
 			}
 			return int(v / 60 * 100)
 		},
-		"t": func(k string) string { return T(lang, k) },
-		"tFmt": func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"t":        func(k string) string { return T(lang, k) },
+		"tFmt":     func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
 		"statName": func(name string) string { return StatName(lang, name) },
-		"lang": func() string { return lang },
+		"lang":     func() string { return lang },
 		"formatWarn": func(w string) string {
 			if lang != LangZhTW {
 				return w

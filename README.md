@@ -57,6 +57,11 @@ A self-hosted World of Warcraft character dashboard that uses the official Battl
 - **Configurable scope** — Expansion category name(s) and the 80% threshold live in `data/achievement_scope.json`
 
 ### 🌐 General
+- **Multi-User Safe Architecture** — Fully isolated concurrent user sessions; clients never share tokens, summaries, caches, history, or OAuth states
+- **Per-Browser Secure Session** — Session cookie (`wow_session_id`) with `HttpOnly`, `SameSite=Lax`, and automatic `Secure` enforcement over HTTPS
+- **One-Time OAuth State** — Cryptographically random state generated per login with expiration and single-use consumption (immune to CSRF and replay attacks)
+- **Verified Battle.net Identity** — Account ownership verified directly from Battle.net's canonical OpenID Connect UserInfo endpoint using the stable subject identifier (`sub`), never client input or game profile fallbacks
+- **Account-Scoped History Tracking** — PostgreSQL progression history is strictly partitioned per Battle.net account; pre-existing unowned history remains private and untouched
 - **Traditional Chinese (zh-TW) & English UI Support** — Full interface translation using Taiwan WoW terminology (宏偉寶庫, 聯盟, 部落, 專業技能, etc.)
 - **Persistent Language Selector** — Switch between English and 繁體中文 on every page (persists via `ui_lang` cookie across reloads and navigation)
 - **Battle.net OAuth2** — Secure login; no passwords stored
@@ -106,6 +111,17 @@ REGION=eu        # us, eu, kr, tw
 LOCALE=en_GB     # en_US, en_GB, de_DE, fr_FR, es_ES, etc.
 # WOW_GAME_VERSION=retail  # retail (default) or forever
 PORT=8081
+
+# Public OAuth Callback URL (Optional — defaults to http://localhost:<PORT>/callback)
+# For reverse proxy or production HTTPS deployments:
+# REDIRECT_URL=https://your-domain.com/callback
+# Or set PUBLIC_URL=https://your-domain.com
+
+# Optional PostgreSQL persistence for account-scoped history tracking
+# DATABASE_URL=postgres://user:password@localhost:5432/wow_stats
+
+# Cookie Security (Optional — auto-enabled over HTTPS or when REDIRECT_URL starts with https://)
+# SESSION_COOKIE_SECURE=true
 ```
 
 ---
@@ -119,6 +135,49 @@ go run .
 ```
 
 OAuth uses global endpoints (`oauth.battle.net`), while `REGION` selects game data.
+
+### Public Callback URL & HTTPS Deployment
+
+By default, the application configures its OAuth callback URL as:
+```text
+http://localhost:<PORT>/callback
+```
+
+When deploying behind a reverse proxy (e.g. Nginx, Caddy, Cloudflare, Traefik) or using HTTPS:
+1. Configure `REDIRECT_URL` (or `PUBLIC_URL`) in your environment:
+   ```env
+   REDIRECT_URL=https://wow.yourdomain.com/callback
+   ```
+2. Add this exact redirect URL to your client in the [Battle.net Developer Portal](https://develop.battle.net/access/).
+3. Ensure your reverse proxy forwards standard proxy headers:
+   ```nginx
+   proxy_set_header Host $host;
+   proxy_set_header X-Real-IP $remote_addr;
+   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   proxy_set_header X-Forwarded-Proto https;
+   ```
+4. **Cookie Security**:
+   - Session cookies (`wow_session_id`) are configured with `HttpOnly: true` and `SameSite: Lax`.
+   - The `Secure` flag is enabled automatically when running under HTTPS, when `X-Forwarded-Proto: https` is forwarded by a reverse proxy, or when `REDIRECT_URL` starts with `https://`.
+   - You can also explicitly enforce `SESSION_COOKIE_SECURE=true` or `false` via environment variable.
+
+### Optional PostgreSQL History & Safe Schema Migration
+
+The application supports optional database tracking for account-wide and per-character gold and item level progression over time:
+- **No Database Configured (`DATABASE_URL` unset)**: The application runs normally in-memory without persistence. The `/history` page displays an informative status message.
+- **Database Configured (`DATABASE_URL` set)**:
+  - On startup, the application connects to PostgreSQL, creates the database if it doesn't exist, and runs schema migration automatically.
+  - Safe migration adds the `account_id` column (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS account_id TEXT;`) with indexes.
+  - **Account Isolation**: Progression snapshots and history charts are strictly partitioned by the user's verified Battle.net account ID.
+  - **Unowned History Privacy**: Pre-existing unowned snapshots (`account_id IS NULL`) from earlier single-user versions are preserved intact and unassigned, and are strictly inaccessible to any authenticated account.
+
+### Persistence & Server Restart Behavior
+
+- **Sessions & Caches (In-Memory)**: User sessions, OAuth access tokens, and lazy page caches (Mythic+, Equipment, and Achievements) are held in an in-memory session store protected by read-write mutex locks. If the server restarts:
+  - In-memory sessions are cleared.
+  - Users safely re-authenticate via Battle.net OAuth.
+- **Progression History (PostgreSQL)**: Snapshots stored in PostgreSQL (`account_snapshots`, `character_snapshots`) persist permanently across server restarts and container rebuilds.
+- **UI State (Client-Side `localStorage`)**: Great Vault slot allocations, weekly checklist items, and pinned achievements are stored directly in browser `localStorage` and are unaffected by server restarts.
 
 ### Language & Localization (UI_LOCALE vs LOCALE)
 
@@ -182,12 +241,16 @@ Then open [http://localhost:8081](http://localhost:8081) in your browser and cli
 
 ---
 
-## Security Notes
+## Security & Multi-User Architecture
 
-- Your `.env` file is listed in `.gitignore` and will **never** be committed
-- Credentials are loaded from environment variables only — nothing is hardcoded
-- The OAuth token is held in memory only and is not persisted to disk
-- No database or external storage is used — all state is stored client-side in `localStorage`
+- **Multi-User Isolation**: Each browser receives an isolated session. Concurrent users never share tokens, character summaries, cached gear or raid progress, debug endpoints, or background refresh jobs.
+- **One-Time OAuth State Verification**: A unique cryptographic random state is generated per login attempt with an expiration timestamp and one-time consumption, eliminating OAuth CSRF and replay attacks.
+- **Battle.net Identity Verification**: Account ownership is verified directly from Battle.net's canonical OpenID Connect UserInfo endpoint (`https://oauth.battle.net/oauth/userinfo`) with the exchanged access token using the stable subject identifier (`sub`), never from client-controlled input or game profile fallbacks.
+- **Session Rotation & Periodic Expiry Cleanup**: Session identifiers rotate immediately upon login to invalidate pre-auth state and background tasks; expired or revoked sessions are automatically purged by a periodic background cleaner.
+- **Isolated Logout & Refresh**: Triggering data refresh or logging out in one client browser only affects that session and leaves other connected users completely unaffected.
+- **Unowned History Privacy**: Pre-existing unowned records in PostgreSQL (`account_id IS NULL`) remain unassigned and private, preventing cross-account exposure.
+- **Credentials Protection**: Your `.env` file is listed in `.gitignore` and credentials are read strictly from the server environment. OAuth access tokens are stored in memory only.
+- **Secure Cookies**: Session cookies use `HttpOnly: true`, `SameSite: Lax`, and `Secure` when operating under HTTPS.
 
 ---
 

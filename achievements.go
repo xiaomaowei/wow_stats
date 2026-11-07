@@ -220,7 +220,14 @@ func getStaticAch(client *http.Client, id int) *staticAch {
 
 // GET /api/achievement?id=123 — name/description/reward for the expand-on-click detail.
 func handleAPIAchievement(w http.ResponseWriter, r *http.Request) {
-	client := apiClient()
+	session := getSession(r)
+	var client *http.Client
+	if session != nil {
+		client = session.Client(r.Context())
+	}
+	if client == nil {
+		client = apiClient()
+	}
 	if client == nil {
 		http.Error(w, "Not authenticated", http.StatusUnauthorized)
 		return
@@ -546,17 +553,23 @@ func buildAchView(client *http.Client, key string) (*achView, error) {
 	return view, nil
 }
 
-func fetchAchProfile(key string) {
-	view, err := func() (*achView, error) {
-		client := apiClient()
-		if client == nil {
-			return nil, fmt.Errorf("not logged in")
-		}
-		return buildAchView(client, key)
-	}()
-	achProfiles.Lock()
-	defer achProfiles.Unlock()
-	e := achProfiles.m[key]
+func fetchAchProfileForSession(session *UserSession, key string) {
+	if session == nil || session.IsRevoked() {
+		return
+	}
+	ctx := session.Context()
+	client := session.Client(ctx)
+	if client == nil {
+		return
+	}
+	view, err := buildAchView(client, key)
+
+	session.AchievementsMu.Lock()
+	defer session.AchievementsMu.Unlock()
+	if session.IsRevoked() || ctx.Err() != nil {
+		return
+	}
+	e := session.Achievements[key]
 	if e == nil {
 		return
 	}
@@ -568,6 +581,10 @@ func fetchAchProfile(key string) {
 	}
 	e.view, e.err, e.fetched = view, "", time.Now()
 	log.Printf("Achievements built for %s: %d expansion groups, %d almost, %d recent", key, len(view.Groups), len(view.Almost), len(view.Recent))
+}
+
+func fetchAchProfile(key string) {
+	fetchAchProfileForSession(getLegacySession(), key)
 }
 
 // ── Page ─────────────────────────────────────────────────────────────────────
@@ -589,12 +606,18 @@ type AchPage struct {
 
 func handleAchievements(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if apiClient() == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Redirect(w, r, "/", http.StatusSeeOther) // home shows the Battle.net login screen
 		return
 	}
 	if r.URL.Query().Get("refresh") == "1" {
-		resetAchProfiles()
+		session.AchievementsMu.Lock()
+		session.Achievements = make(map[string]*achProfileEntry)
+		session.AchievementsMu.Unlock()
+		if session == legacySession {
+			resetAchProfiles()
+		}
 		achCats.Lock()
 		if achCats.err != "" {
 			achCats.fetched = time.Time{}
@@ -604,7 +627,17 @@ func handleAchievements(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chars := eligibleCharacters(10)
+	if session == legacySession {
+		achProfiles.Lock()
+		session.AchievementsMu.Lock()
+		for k, v := range achProfiles.m {
+			session.Achievements[k] = v
+		}
+		session.AchievementsMu.Unlock()
+		achProfiles.Unlock()
+	}
+
+	chars := session.EligibleCharacters(10)
 	page := AchPage{Scope: loadAchScope()}
 	sel := strings.ToLower(r.URL.Query().Get("c"))
 	valid := false
@@ -635,20 +668,20 @@ func handleAchievements(w http.ResponseWriter, r *http.Request) {
 
 	if catErr != "" && !catReady {
 		page.Err = catErr
-	} else if catReady {
-		achProfiles.Lock()
-		e := achProfiles.m[sel]
+	} else if catReady && sel != "" {
+		session.AchievementsMu.Lock()
+		e := session.Achievements[sel]
 		if e == nil {
 			e = &achProfileEntry{}
-			achProfiles.m[sel] = e
+			session.Achievements[sel] = e
 		}
 		if (e.view == nil || time.Since(e.fetched) > cacheTTL) && !e.loading && e.err == "" {
 			e.loading = true
-			go fetchAchProfile(sel)
+			go fetchAchProfileForSession(session, sel)
 		}
 		page.View = e.view
 		page.Err = e.err
-		achProfiles.Unlock()
+		session.AchievementsMu.Unlock()
 	}
 	page.Loading = page.Err == "" && page.View == nil
 	if page.View != nil && len(page.View.Groups) == 0 {
@@ -659,9 +692,9 @@ func handleAchievements(w http.ResponseWriter, r *http.Request) {
 	tmpl, err := template.New("achievements-page").Funcs(template.FuncMap{
 		"join":  strings.Join,
 		"lower": strings.ToLower,
-		"t": func(k string) string { return T(lang, k) },
-		"tFmt": func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
-		"lang": func() string { return lang },
+		"t":     func(k string) string { return T(lang, k) },
+		"tFmt":  func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+		"lang":  func() string { return lang },
 	}).Parse(BuildAchievementsTemplate(lang, r.URL.RequestURI()))
 	if err != nil {
 		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)

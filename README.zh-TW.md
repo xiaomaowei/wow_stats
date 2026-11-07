@@ -57,6 +57,11 @@
 - **可自訂範圍** — 資料片分類名稱與 80% 門檻值設定於 `data/achievement_scope.json` 中
 
 ### 🌐 通用特性
+- **安全多使用者架構** — 完整隔離並行使用者 Session；不同瀏覽器與使用者絕不共用 Token、角色摘要、快取、歷程記錄或 OAuth State
+- **瀏覽器獨立安全 Session** — 透過 `wow_session_id` Cookie 追蹤 Session，具備 `HttpOnly`、`SameSite=Lax` 與 HTTPS 自動啟用 `Secure` 旗標
+- **單次拋棄式 OAuth State** — 每次登入獨立生成高強度密碼學隨機 State，包含過期驗證與單次消耗機制，杜絕 CSRF 與重放攻擊
+- **Battle.net 伺服器端身分驗證** — 帳號所有權直接由 Battle.net 標準 OpenID Connect UserInfo 端點使用穩定唯一的 `sub` 識別碼進行驗證，完全不採信使用者自訂輸入或遊戲角色設定檔 Fallback
+- **帳號隔離歷程記錄追蹤** — PostgreSQL 歷程記錄依 Battle.net 帳號嚴格劃分，既有舊版無主資料保持獨立私密、不外洩
 - **繁體中文 (zh-TW) 與英文 UI 支援** — 完整介面在地化，使用台灣魔獸世界專有名詞（宏偉寶庫、聯盟、部落、專業技能等）
 - **持久化語言選擇器** — 在每個頁面皆可在 English 與繁體中文之間切換（透過 `ui_lang` Cookie 在重整與頁面跳轉間保持設定）
 - **Battle.net OAuth2** — 安全登入；不儲存任何密碼
@@ -106,6 +111,17 @@ REGION=eu        # us, eu, kr, tw
 LOCALE=en_GB     # en_US, en_GB, de_DE, fr_FR, es_ES, etc.
 # WOW_GAME_VERSION=retail  # retail (預設) 或 forever
 PORT=8081
+
+# 公開 OAuth 回呼網址（選填 — 預設為 http://localhost:<PORT>/callback）
+# 適用於反向代理或正式 HTTPS 部署：
+# REDIRECT_URL=https://your-domain.com/callback
+# 或設定 PUBLIC_URL=https://your-domain.com
+
+# 選用：PostgreSQL 持久化連線字串（帳號隔離歷程記錄追蹤）
+# DATABASE_URL=postgres://user:password@localhost:5432/wow_stats
+
+# Cookie 安全性（選填 — 在 HTTPS 環境或 REDIRECT_URL 以 https:// 開頭時自動啟用）
+# SESSION_COOKIE_SECURE=true
 ```
 
 ---
@@ -119,6 +135,49 @@ go run .
 ```
 
 OAuth 使用全域端點（`oauth.battle.net`），而 `REGION` 則用來選擇遊戲資料伺服器。
+
+### 公開回呼網址 (Public Callback URL) 與 HTTPS 部署
+
+預設情況下，應用程式的 OAuth 回呼網址會依據連接埠自動設定為：
+```text
+http://localhost:<PORT>/callback
+```
+
+當透過反向代理伺服器（如 Nginx、Caddy、Cloudflare、Traefik）部署或使用 HTTPS 網域時：
+1. 於環境變數中設定 `REDIRECT_URL`（或 `PUBLIC_URL`）：
+   ```env
+   REDIRECT_URL=https://wow.yourdomain.com/callback
+   ```
+2. 請務必前往 [Battle.net 開發者入口網站](https://develop.battle.net/access/)，將此完整的重新導向網址加入用戶端設定中。
+3. 反向代理伺服器請轉發標準 Proxy 標頭：
+   ```nginx
+   proxy_set_header Host $host;
+   proxy_set_header X-Real-IP $remote_addr;
+   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+   proxy_set_header X-Forwarded-Proto https;
+   ```
+4. **Cookie 安全性**：
+   - Session Cookie（`wow_session_id`）預設包含 `HttpOnly: true` 與 `SameSite: Lax`。
+   - 當處於 HTTPS 環境、反向代理轉發 `X-Forwarded-Proto: https`、或 `REDIRECT_URL` 以 `https://` 開頭時，自動加上 `Secure` 旗標。
+   - 亦可透過 `SESSION_COOKIE_SECURE=true` 或 `false` 明確指定。
+
+### 選用 PostgreSQL 歷程記錄、安全結構遷移與無主資料防護
+
+本系統支援選用的 PostgreSQL 資料庫以記錄帳號與各角色的裝備物品等級與金幣成長歷程：
+- **未設定資料庫 (`DATABASE_URL` 未填)**：應用程式以純記憶體模式正常執行，不影響核心功能，`/history` 頁面顯示未啟用資料庫之提示。
+- **已設定資料庫 (`DATABASE_URL` 已填)**：
+  - 應用程式啟動時會自動建立資料庫（若不存在）並執行安全結構遷移。
+  - 安全結構遷移採用 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS account_id TEXT;` 加入帳號欄位與索引。
+  - **帳號嚴格隔離**：使用者查詢歷史快照與成長圖表時，僅能查詢並檢視由 Battle.net 驗證身分所擁有的資料。
+  - **既有舊版無主資料防護**：升級前既有的歷史快照（`account_id IS NULL`）將完整保留在資料庫中，不推斷所有權、不進行指派，且絕不會外洩給任何登入之帳號。
+
+### 持久化與伺服器重啟行為說明
+
+- **使用者 Session 與快取（記憶體儲存）**：使用者的登入 Session、OAuth 存取權杖，以及延遲載入之快取資料（傳奇+、裝備、成就）皆儲存於記憶體中的 Session 管理器並受讀寫鎖保護。當伺服器重新啟動時：
+  - 記憶體中的 Session 會被清空。
+  - 使用者安全地透過 Battle.net OAuth 重新登入即可。
+- **成長歷史記錄（PostgreSQL 持久化）**：儲存於 PostgreSQL 中的歷程快照（`account_snapshots` 與 `character_snapshots`）會在伺服器重啟或容器重建後永久保留。
+- **介面操作狀態（用戶端 `localStorage`）**：宏偉寶庫放置狀態、每週勾選清單與釘選成就直接儲存在使用者的瀏覽器 `localStorage` 中，伺服器重啟完全不影響其內容。
 
 ### 語言與在地化設定 (UI_LOCALE 與 LOCALE)
 
@@ -182,12 +241,16 @@ docker-compose up --build
 
 ---
 
-## 安全性注意事項
+## 安全性與多使用者架構
 
-- 您的 `.env` 檔案已列在 `.gitignore` 中，**絕不會**被提交
-- 憑證僅從環境變數載入 — 無任何硬編碼
-- OAuth Token 僅保存在記憶體中，不會寫入磁碟持久保存
-- 未使用任何資料庫或外部儲存 — 所有狀態皆儲存在用戶端瀏覽器的 `localStorage` 中
+- **多使用者完整隔離**：每部瀏覽器皆配發獨立的 Session。並行使用者絕不會互相共享 Token、角色統計資料、裝備與團隊副本進度快取、除錯端點或背景更新工作。
+- **單次拋棄式 OAuth State 驗證**：每次登入皆會動態生成具備過期時間且僅能驗證一次的高強度隨機 State，全面杜絕 OAuth CSRF 與授權碼重放攻擊。
+- **Battle.net 伺服器端身分驗證**：登入使用者的帳號歸屬（Account ID 與 BattleTag）直接經由 Battle.net 規範之 OpenID Connect UserInfo 端點（`https://oauth.battle.net/oauth/userinfo`）憑 Access Token 驗證確認其穩定唯一的 `sub` 識別碼，絕不採用用戶端傳入之非受信任參數，亦絕不 Fallback 至遊戲設定檔 API 以防識別碼命名空間混淆。
+- **Session 輪換與週期性過期清理**：登入成功後立即輪換 Session 識別碼並作廢先前預先授權狀態與背景工作；伺服器端過期或被撤銷之 Session 由背景定時清理機制自動清除。
+- **隔離登出與重新整理**：任何用戶端進行登出或重新整理，僅會清除與操作其自身 Session，絕不會影響其他連線使用者的狀態。
+- **無主歷史資料隱私**：升級前既有之無主資料（`account_id IS NULL`）維持未指派狀態，任何登入帳號皆無法存取，確保舊資料不外洩。
+- **憑證與 Token 保護**：`.env` 已列入 `.gitignore`，機密憑證由伺服器環境提供。OAuth Access Token 僅存於伺服器記憶體中。
+- **安全 Cookie 設定**：Session Cookie 預設具備 `HttpOnly: true` 與 `SameSite: Lax`，且於 HTTPS 環境下自動開啟 `Secure` 旗標。
 
 ---
 

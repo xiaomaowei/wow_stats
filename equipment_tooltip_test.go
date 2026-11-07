@@ -293,14 +293,14 @@ func TestEquipmentTemplate_EscapesXSS(t *testing.T) {
 
 	// Parse and execute template
 	tmpl, err := template.New("equipment").Funcs(template.FuncMap{
-		"key":   func(c EQChar) string { return c.Name + "-" + c.Realm },
-		"lower": strings.ToLower,
-		"pct":   func(v float64) string { return "0.0" },
-		"bar":   func(v float64) int { return 0 },
-		"t":     func(k string) string { return T(LangEn, k) },
-		"tFmt":  func(k string, args ...interface{}) string { return TFmt(LangEn, k, args...) },
-		"statName": func(name string) string { return StatName(LangEn, name) },
-		"lang":  func() string { return LangEn },
+		"key":        func(c EQChar) string { return c.Name + "-" + c.Realm },
+		"lower":      strings.ToLower,
+		"pct":        func(v float64) string { return "0.0" },
+		"bar":        func(v float64) int { return 0 },
+		"t":          func(k string) string { return T(LangEn, k) },
+		"tFmt":       func(k string, args ...interface{}) string { return TFmt(LangEn, k, args...) },
+		"statName":   func(name string) string { return StatName(LangEn, name) },
+		"lang":       func() string { return LangEn },
 		"formatWarn": func(w string) string { return w },
 	}).Parse(BuildEquipmentTemplate(LangEn, "/equipment"))
 	if err != nil {
@@ -373,14 +373,14 @@ func TestEquipmentTemplate_Localization(t *testing.T) {
 			}
 
 			tmpl, err := template.New("equipment").Funcs(template.FuncMap{
-				"key":   func(c EQChar) string { return c.Name + "-" + c.Realm },
-				"lower": strings.ToLower,
-				"pct":   func(v float64) string { return "0.0" },
-				"bar":   func(v float64) int { return 0 },
-				"t":     func(k string) string { return T(lang, k) },
-				"tFmt":  func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
-				"statName": func(name string) string { return StatName(lang, name) },
-				"lang":  func() string { return lang },
+				"key":        func(c EQChar) string { return c.Name + "-" + c.Realm },
+				"lower":      strings.ToLower,
+				"pct":        func(v float64) string { return "0.0" },
+				"bar":        func(v float64) int { return 0 },
+				"t":          func(k string) string { return T(lang, k) },
+				"tFmt":       func(k string, args ...interface{}) string { return TFmt(lang, k, args...) },
+				"statName":   func(name string) string { return StatName(lang, name) },
+				"lang":       func() string { return lang },
 				"formatWarn": func(w string) string { return w },
 			}).Parse(BuildEquipmentTemplate(lang, "/equipment"))
 			if err != nil {
@@ -476,7 +476,26 @@ func TestEquipmentHandler_WorksOnForever(t *testing.T) {
 	eqState.loading = false
 	eqState.Unlock()
 
+	sess := globalSessions.Create()
+	sess.mu.Lock()
+	sess.Authenticated = true
+	sess.Token = &oauth2.Token{AccessToken: "mock-forever-token", Expiry: time.Now().Add(time.Hour)}
+	sess.Summary = AccountSummary{
+		Authenticated: true,
+		Characters: []CharacterStats{
+			{Name: "Arthas Menethil", Realm: "Normal", Level: 25},
+		},
+	}
+	sess.mu.Unlock()
+	sess.Equipment.Lock()
+	sess.Equipment.Data = eqState.data
+	sess.Equipment.Fetched = time.Now()
+	sess.Equipment.Loading = false
+	sess.Equipment.Unlock()
+	defer globalSessions.Delete(sess.ID)
+
 	req := httptest.NewRequest("GET", "/equipment?c=arthas-menethil-normal&lang=zh-TW", nil)
+	req.AddCookie(&http.Cookie{Name: SessionCookieName, Value: sess.ID})
 	rr := httptest.NewRecorder()
 
 	handleEquipment(rr, req)

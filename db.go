@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -119,6 +120,7 @@ func migrateSchema() error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS character_snapshots (
 			id             BIGSERIAL PRIMARY KEY,
+			account_id     TEXT,
 			recorded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			character_name TEXT        NOT NULL,
 			realm          TEXT        NOT NULL,
@@ -129,12 +131,22 @@ func migrateSchema() error {
 
 		CREATE TABLE IF NOT EXISTS account_snapshots (
 			id           BIGSERIAL PRIMARY KEY,
+			account_id   TEXT,
 			recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			total_gold   BIGINT,
 			mounts       INT,
 			pets         INT,
 			char_count   INT
 		);
+
+		ALTER TABLE character_snapshots ADD COLUMN IF NOT EXISTS account_id TEXT;
+		ALTER TABLE account_snapshots ADD COLUMN IF NOT EXISTS account_id TEXT;
+
+		CREATE INDEX IF NOT EXISTS idx_char_snapshots_account_name_realm
+			ON character_snapshots (account_id, character_name, realm, recorded_at DESC);
+
+		CREATE INDEX IF NOT EXISTS idx_account_snapshots_account_recorded
+			ON account_snapshots (account_id, recorded_at DESC);
 
 		CREATE INDEX IF NOT EXISTS idx_char_snapshots_name_realm
 			ON character_snapshots (character_name, realm, recorded_at DESC);
@@ -145,10 +157,18 @@ func migrateSchema() error {
 	return err
 }
 
-// saveSnapshot writes a timestamped snapshot of current data to Postgres.
+// saveSnapshot writes a timestamped snapshot of current data to Postgres for the specified account.
 // Called in a goroutine after each successful data refresh — never blocks the UI.
-func saveSnapshot(summary AccountSummary) {
+// Existing unowned history remains intact and untouched; snapshots without an account ID are rejected.
+func saveSnapshot(summary AccountSummary, accountIDs ...string) {
 	if db == nil {
+		return
+	}
+	var accountID string
+	if len(accountIDs) > 0 {
+		accountID = strings.TrimSpace(accountIDs[0])
+	}
+	if accountID == "" {
 		return
 	}
 
@@ -161,8 +181,9 @@ func saveSnapshot(summary AccountSummary) {
 
 	// Account-wide snapshot
 	_, err = tx.Exec(`
-		INSERT INTO account_snapshots (total_gold, mounts, pets, char_count)
-		VALUES ($1, $2, $3, $4)`,
+		INSERT INTO account_snapshots (account_id, total_gold, mounts, pets, char_count)
+		VALUES ($1, $2, $3, $4, $5)`,
+		accountID,
 		summary.TotalGold,
 		summary.MountsCollected,
 		summary.PetsCollected,
@@ -179,8 +200,9 @@ func saveSnapshot(summary AccountSummary) {
 			continue
 		}
 		_, err = tx.Exec(`
-			INSERT INTO character_snapshots (character_name, realm, level, item_level, gold)
-			VALUES ($1, $2, $3, $4, $5)`,
+			INSERT INTO character_snapshots (account_id, character_name, realm, level, item_level, gold)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			accountID,
 			c.Name, c.Realm, c.Level, c.ItemLevel, c.Gold,
 		)
 		if err != nil {
@@ -194,8 +216,8 @@ func saveSnapshot(summary AccountSummary) {
 		return
 	}
 
-	log.Printf("DB snapshot saved — %d characters, total gold: %s",
-		len(summary.Characters), formatGold(summary.TotalGold))
+	log.Printf("DB snapshot saved for account %s — %d characters, total gold: %s",
+		accountID, len(summary.Characters), formatGold(summary.TotalGold))
 }
 
 // ── History query types ──────────────────────────────────────────────────────
@@ -217,19 +239,29 @@ type CharacterHistory struct {
 	LatestIlvl int // used for sorting — not rendered directly
 }
 
-// getAccountHistory returns the last 90 account snapshots, oldest first.
-func getAccountHistory() (AccountHistory, error) {
+// getAccountHistory returns the last 90 account snapshots for the specified account, oldest first.
+// If accountID is empty or db is nil, an empty AccountHistory is returned.
+// Existing unowned rows (where account_id IS NULL) are never returned.
+func getAccountHistory(accountIDs ...string) (AccountHistory, error) {
 	var h AccountHistory
 	if db == nil {
+		return h, nil
+	}
+	var accountID string
+	if len(accountIDs) > 0 {
+		accountID = strings.TrimSpace(accountIDs[0])
+	}
+	if accountID == "" {
 		return h, nil
 	}
 
 	rows, err := db.Query(`
 		SELECT recorded_at, total_gold, mounts, pets
 		FROM account_snapshots
+		WHERE account_id = $1
 		ORDER BY recorded_at DESC
 		LIMIT 90
-	`)
+	`, accountID)
 	if err != nil {
 		return h, err
 	}
@@ -265,20 +297,28 @@ func getAccountHistory() (AccountHistory, error) {
 }
 
 // getCharacterHistories returns item level + gold + level history for every
-// character that has at least 2 snapshots, limited to the last 90 points each.
+// character belonging to accountID that has at least 2 snapshots, limited to the last 90 points each.
 // Results are sorted by the character's most recent item level, highest first
 // (matching the home page ordering).
-func getCharacterHistories() ([]CharacterHistory, error) {
+// Existing unowned rows (where account_id IS NULL) are never returned.
+func getCharacterHistories(accountIDs ...string) ([]CharacterHistory, error) {
 	if db == nil {
 		return nil, nil
 	}
+	var accountID string
+	if len(accountIDs) > 0 {
+		accountID = strings.TrimSpace(accountIDs[0])
+	}
+	if accountID == "" {
+		return nil, nil
+	}
 
-	// Get distinct characters that have history — order doesn't matter here,
-	// we sort in Go after fetching each character's data.
+	// Get distinct characters for this account that have history.
 	charRows, err := db.Query(`
 		SELECT DISTINCT character_name, realm
 		FROM character_snapshots
-	`)
+		WHERE account_id = $1
+	`, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -300,10 +340,10 @@ func getCharacterHistories() ([]CharacterHistory, error) {
 		rows, err := db.Query(`
 			SELECT recorded_at, item_level, level, gold
 			FROM character_snapshots
-			WHERE character_name = $1 AND realm = $2
+			WHERE account_id = $1 AND character_name = $2 AND realm = $3
 			ORDER BY recorded_at DESC
 			LIMIT 90
-		`, c.name, c.realm)
+		`, accountID, c.name, c.realm)
 		if err != nil {
 			return nil, err
 		}

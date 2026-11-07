@@ -232,33 +232,51 @@ func ordinal(n int) string {
 	return "th"
 }
 
-func fetchAllMythic() {
+func fetchAllMythicForSession(session *UserSession) {
+	if session == nil || session.IsRevoked() {
+		return
+	}
 	defer func() {
-		mpState.Lock()
-		mpState.loading = false
-		mpState.Unlock()
+		session.MythicPlus.Lock()
+		session.MythicPlus.Loading = false
+		session.MythicPlus.Unlock()
 	}()
-	client := apiClient()
+	ctx := session.Context()
+	client := session.Client(ctx)
 	if client == nil {
 		return
 	}
 	vt := loadVaultTable()
 	reset := lastWeeklyReset(time.Now())
-	chars := eligibleCharacters(10)
+	chars := session.EligibleCharacters(10)
 
 	results := make([]MPChar, len(chars))
 	sem := make(chan struct{}, 5)
 	var wg sync.WaitGroup
 	for i, c := range chars {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		wg.Add(1)
 		go func(i int, c CharacterStats) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
+			if session.IsRevoked() || ctx.Err() != nil {
+				return
+			}
 			results[i] = fetchMythicProfile(client, c, vt, reset)
 		}(i, c)
 	}
 	wg.Wait()
+
+	if session.IsRevoked() || ctx.Err() != nil {
+		return
+	}
 
 	// Highest rating first, then level
 	sort.SliceStable(results, func(i, j int) bool {
@@ -268,11 +286,26 @@ func fetchAllMythic() {
 		return results[i].Level > results[j].Level
 	})
 
-	mpState.Lock()
-	mpState.data = results
-	mpState.fetched = time.Now()
-	mpState.Unlock()
+	session.MythicPlus.Lock()
+	if !session.IsRevoked() && ctx.Err() == nil {
+		session.MythicPlus.Data = results
+		session.MythicPlus.Fetched = time.Now()
+	}
+	session.MythicPlus.Unlock()
 	log.Printf("Mythic+ data fetched for %d characters", len(results))
+}
+
+func fetchAllMythic() {
+	legacy := getLegacySession()
+	fetchAllMythicForSession(legacy)
+	legacy.MythicPlus.RLock()
+	data := legacy.MythicPlus.Data
+	fetched := legacy.MythicPlus.Fetched
+	legacy.MythicPlus.RUnlock()
+	mpState.Lock()
+	mpState.data = data
+	mpState.fetched = fetched
+	mpState.Unlock()
 }
 
 // ── Handler ──────────────────────────────────────────────────────────────────
@@ -285,28 +318,46 @@ func fmtDuration(ms int64) string {
 const defaultVaultIlvlNote = "Reward item levels are placeholders (TWW-era values) — edit data/vault_ilvl.json to match the current season."
 
 func handleMythicPlus(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("refresh") == "1" {
-		clearExtraCaches()
-		http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if apiClient() == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Redirect(w, r, "/", http.StatusSeeOther) // home shows the Battle.net login screen
 		return
 	}
 
+	if r.URL.Query().Get("refresh") == "1" {
+		session.MythicPlus.Lock()
+		session.MythicPlus.Fetched = time.Time{}
+		session.MythicPlus.Unlock()
+		if session == legacySession {
+			clearExtraCaches()
+		}
+		http.Redirect(w, r, r.URL.Path, http.StatusSeeOther)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Legacy bridge for tests that populate global mpState directly
+	if session == legacySession {
+		mpState.Lock()
+		session.MythicPlus.Lock()
+		session.MythicPlus.Data = mpState.data
+		session.MythicPlus.Fetched = mpState.fetched
+		session.MythicPlus.Loading = mpState.loading
+		session.MythicPlus.Unlock()
+		mpState.Unlock()
+	}
+
 	lang := ResolveLanguage(r)
 
-	mpState.Lock()
-	stale := mpState.fetched.IsZero() || time.Since(mpState.fetched) > cacheTTL
-	if stale && !mpState.loading {
-		mpState.loading = true
-		go fetchAllMythic()
+	session.MythicPlus.Lock()
+	stale := session.MythicPlus.Fetched.IsZero() || time.Since(session.MythicPlus.Fetched) > cacheTTL
+	if stale && !session.MythicPlus.Loading {
+		session.MythicPlus.Loading = true
+		go fetchAllMythicForSession(session)
 	}
-	data := mpState.data
-	fetched := mpState.fetched
-	mpState.Unlock()
+	data := session.MythicPlus.Data
+	fetched := session.MythicPlus.Fetched
+	session.MythicPlus.Unlock()
 
 	page := MPPageData{Loading: fetched.IsZero()}
 	if !page.Loading {

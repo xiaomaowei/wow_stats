@@ -144,13 +144,28 @@ func main() {
 		}
 	}
 
+	// Public callback URL configuration
+	// Configures public callback URL via environment with safe default (http://localhost:<port>/callback)
+	redirectURL := os.Getenv("REDIRECT_URL")
+	if redirectURL == "" {
+		redirectURL = os.Getenv("OAUTH_REDIRECT_URL")
+	}
+	if redirectURL == "" {
+		if publicURL := os.Getenv("PUBLIC_URL"); publicURL != "" {
+			redirectURL = strings.TrimRight(publicURL, "/") + "/callback"
+		}
+	}
+	if redirectURL == "" {
+		redirectURL = fmt.Sprintf("http://localhost:%s/callback", port)
+	}
+
 	config = Config{
 		ClientID:     os.Getenv("BLIZZARD_CLIENT_ID"),
 		ClientSecret: os.Getenv("BLIZZARD_CLIENT_SECRET"),
 		Region:       region,
 		Locale:       getEnvOrDefault("LOCALE", "en_US"),
 		Port:         port,
-		RedirectURL:  fmt.Sprintf("http://localhost:%s/callback", port),
+		RedirectURL:  redirectURL,
 		GameVersion:  gameVersion,
 	}
 	InitUILanguage(config.Locale, os.Getenv("UI_LOCALE"))
@@ -159,7 +174,7 @@ func main() {
 		log.Fatal("BLIZZARD_CLIENT_ID and BLIZZARD_CLIENT_SECRET are required")
 	}
 
-	// Generate random state for OAuth
+	// Generate random state for OAuth (legacy fallback)
 	oauthState = generateRandomState()
 
 	// Setup OAuth2 configuration
@@ -167,7 +182,7 @@ func main() {
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
 		RedirectURL:  config.RedirectURL,
-		Scopes:       []string{"wow.profile"},
+		Scopes:       []string{"openid", "wow.profile"},
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  "https://oauth.battle.net/authorize",
 			TokenURL: "https://oauth.battle.net/token",
@@ -207,6 +222,10 @@ func main() {
 	fs := http.FileServer(http.Dir("./images"))
 	http.Handle("/images/", http.StripPrefix("/images/", fs))
 
+	// Periodically clean expired/revoked sessions from store
+	stopCleaner := globalSessions.StartPeriodicCleanup(SessionCleanupInterval)
+	defer stopCleaner()
+
 	// Start server
 	addr := ":" + config.Port
 	log.Printf("Server starting on %s", addr)
@@ -226,11 +245,24 @@ func generateRandomState() string {
 }
 
 func handleLogin(w http.ResponseWriter, r *http.Request) {
-	url := oauth2Config.AuthCodeURL(oauthState)
+	session := getOrCreateSession(w, r)
+	state := generateRandomState()
+	session.SetPendingOAuthState(state)
+
+	url := oauth2Config.AuthCodeURL(state)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
+	if session != nil {
+		session.Invalidate()
+		if session != legacySession {
+			globalSessions.Delete(session.ID)
+		}
+	}
+
+	// Clear legacy globals if set (for backward compatibility with legacy tests)
 	tokenMutex.Lock()
 	userToken = nil
 	tokenMutex.Unlock()
@@ -241,36 +273,72 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	summaryMutex.Unlock()
 
-	log.Println("User logged out — token cleared")
+	clearSessionCookie(w, r)
+	log.Println("User logged out — session and token cleared")
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func handleCallback(w http.ResponseWriter, r *http.Request) {
-	if r.FormValue("state") != oauthState {
-		http.Error(w, "Invalid state", http.StatusBadRequest)
+	preAuthSession := getSession(r)
+	if preAuthSession == nil {
+		http.Error(w, "Session not found or cookies disabled", http.StatusBadRequest)
+		return
+	}
+
+	state := r.FormValue("state")
+	if !preAuthSession.ConsumePendingOAuthState(state) {
+		http.Error(w, "Invalid or expired state", http.StatusBadRequest)
 		return
 	}
 
 	code := r.FormValue("code")
-	token, err := oauth2Config.Exchange(context.Background(), code)
+	token, err := oauth2Config.Exchange(r.Context(), code)
 	if err != nil {
+		preAuthSession.Invalidate()
+		if preAuthSession != legacySession {
+			globalSessions.Delete(preAuthSession.ID)
+		}
+		clearSessionCookie(w, r)
 		http.Error(w, fmt.Sprintf("Failed to exchange token: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	tokenMutex.Lock()
-	userToken = token
-	tokenMutex.Unlock()
+	ctx := r.Context()
+	client := oauth2Config.Client(ctx, token)
+	ident, err := verifyBattleNetIdentity(ctx, client, token)
+	if err != nil || ident.AccountID == "" {
+		log.Printf("Identity verification failed: %v", err)
+		preAuthSession.Invalidate()
+		if preAuthSession != legacySession {
+			globalSessions.Delete(preAuthSession.ID)
+		}
+		clearSessionCookie(w, r)
+		http.Error(w, "Failed to verify identity from Battle.net", http.StatusUnauthorized)
+		return
+	}
 
-	log.Println("Successfully authenticated with Battle.net")
+	// Rotate session: invalidate pre-auth session and issue a fresh authenticated session
+	preAuthSession.Invalidate()
+	if preAuthSession != legacySession {
+		globalSessions.Delete(preAuthSession.ID)
+	}
 
-	// Immediately set authenticated status so the page knows to wait for data
-	summaryMutex.Lock()
-	accountSummary.Authenticated = true
-	accountSummary.Characters = nil // Clear any old data
-	summaryMutex.Unlock()
+	newSess := globalSessions.Create()
+	newSess.mu.Lock()
+	newSess.Token = token
+	newSess.AccountID = ident.AccountID
+	newSess.BattleTag = ident.BattleTag
+	newSess.Authenticated = true
+	newSess.Summary = AccountSummary{
+		Authenticated: true,
+		Characters:    nil,
+	}
+	newSess.mu.Unlock()
 
-	go fetchCharacterData()
+	setSessionCookie(w, r, newSess.ID)
+	log.Printf("Successfully authenticated account %s (%s) with Battle.net", ident.AccountID, ident.BattleTag)
+
+	go fetchCharacterDataForSession(newSess)
 
 	http.Redirect(w, r, "/?loading=true", http.StatusSeeOther)
 }
@@ -444,70 +512,113 @@ func parseAccountCharacters(body []byte, isForever bool) ([]DiscoveredCharacter,
 }
 
 func fetchCharacterData() {
-	tokenMutex.RLock()
-	token := userToken
-	tokenMutex.RUnlock()
+	session := getLegacySession()
+	fetchCharacterDataForSession(session)
+	summaryMutex.Lock()
+	accountSummary = session.GetSummary()
+	summaryMutex.Unlock()
+}
 
-	if token == nil {
-		log.Println("No authentication token available")
-		summaryMutex.Lock()
-		accountSummary = AccountSummary{
+func httpGetWithContext(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+func fetchCharacterDataForSession(session *UserSession) {
+	if session == nil || session.IsRevoked() {
+		return
+	}
+	session.mu.Lock()
+	if session.Refreshing {
+		session.mu.Unlock()
+		return
+	}
+	session.Refreshing = true
+	token := session.Token
+	session.mu.Unlock()
+
+	defer func() {
+		session.mu.Lock()
+		session.Refreshing = false
+		session.mu.Unlock()
+	}()
+
+	if token == nil || session.IsRevoked() {
+		log.Println("No authentication token available for session")
+		session.mu.Lock()
+		session.Summary = AccountSummary{
 			Authenticated: false,
 			LastUpdate:    time.Now(),
 		}
-		summaryMutex.Unlock()
+		session.mu.Unlock()
 		return
 	}
 
-	ctx := context.Background()
+	ctx := session.Context()
 	client := oauth2Config.Client(ctx, token)
 
 	// Fetch WoW account list
 	accountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=%s&locale=%s",
 		config.Region, config.ProfileNamespace(), config.Locale)
 
-	resp, err := client.Get(accountsURL)
+	resp, err := httpGetWithContext(ctx, client, accountsURL)
 	if err != nil {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		log.Printf("Error fetching WoW accounts: %v", err)
-		summaryMutex.Lock()
-		accountSummary.Error = fmt.Sprintf("API error: %v", err)
-		accountSummary.LastUpdate = time.Now()
-		summaryMutex.Unlock()
+		session.mu.Lock()
+		session.Summary.Error = fmt.Sprintf("API error: %v", err)
+		session.Summary.LastUpdate = time.Now()
+		session.mu.Unlock()
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		log.Printf("Error fetching WoW accounts: HTTP %d (URL: %s): %s", resp.StatusCode, accountsURL, string(bodyBytes))
-		summaryMutex.Lock()
-		accountSummary.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
-		accountSummary.LastUpdate = time.Now()
-		summaryMutex.Unlock()
+		session.mu.Lock()
+		session.Summary.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		session.Summary.LastUpdate = time.Now()
+		session.mu.Unlock()
 		return
 	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		log.Printf("Error reading accounts response: %v", err)
-		summaryMutex.Lock()
-		accountSummary.Error = fmt.Sprintf("Read error: %v", err)
-		accountSummary.LastUpdate = time.Now()
-		summaryMutex.Unlock()
+		session.mu.Lock()
+		session.Summary.Error = fmt.Sprintf("Read error: %v", err)
+		session.Summary.LastUpdate = time.Now()
+		session.mu.Unlock()
 		return
 	}
 
 	discovered, err := parseAccountCharacters(bodyBytes, config.IsForever())
 	if err != nil {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		log.Printf("Error decoding accounts response: %v", err)
-		summaryMutex.Lock()
-		accountSummary.Error = fmt.Sprintf("Decode error: %v", err)
-		accountSummary.LastUpdate = time.Now()
-		summaryMutex.Unlock()
+		session.mu.Lock()
+		session.Summary.Error = fmt.Sprintf("Decode error: %v", err)
+		session.Summary.LastUpdate = time.Now()
+		session.mu.Unlock()
 		return
 	}
 
-	log.Printf("Found %d characters across accounts", len(discovered))
+	accountID := session.GetAccountID()
+	log.Printf("Found %d characters across accounts for account %s", len(discovered), accountID)
 	for _, ch := range discovered {
 		log.Printf("  character: name='%s', surname='%s', realm='%s', level=%d", ch.Name, ch.Surname, ch.RealmSlug, ch.Level)
 	}
@@ -521,16 +632,29 @@ func fetchCharacterData() {
 	semaphore := make(chan struct{}, 10)
 
 	for _, cd := range discovered {
+		if session.IsRevoked() || ctx.Err() != nil {
+			return
+		}
 		wg.Add(1)
 		go func(char DiscoveredCharacter) {
 			defer wg.Done()
 
-			// Acquire semaphore
-			semaphore <- struct{}{}
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-semaphore }()
 
-			// Small delay to avoid rate limiting
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-ctx.Done():
+				return
+			}
+
+			if session.IsRevoked() || ctx.Err() != nil {
+				return
+			}
 
 			lookupRealm := char.RealmSlug
 			lookupName := char.Name
@@ -543,7 +667,10 @@ func fetchCharacterData() {
 				}
 			}
 
-			stats := fetchCharacterDetails(client, lookupRealm, lookupName, char.ProtectedHref)
+			stats := fetchCharacterDetailsWithContext(ctx, client, lookupRealm, lookupName, char.ProtectedHref)
+			if session.IsRevoked() || ctx.Err() != nil {
+				return
+			}
 			if config.IsForever() && char.FullName != "" {
 				stats.Name = char.FullName
 				stats.Surname = char.Surname
@@ -577,14 +704,15 @@ func fetchCharacterData() {
 	}()
 
 	for stats := range statsChan {
-		// Characters below level 10 return 404 from the profile API.
-		// Keep them but mark them so we can show a minimal stub card.
-		// If level >= 10, an HTTP 404 is an API error and should not be disguised as below_level_10.
 		if stats.Error == "HTTP 404" && stats.Level < 10 {
 			log.Printf("Stub card for %s-%s (below level 10, no profile data available)", stats.Realm, stats.Name)
 			stats.Error = "below_level_10"
 		}
 		allCharacters = append(allCharacters, stats)
+	}
+
+	if session.IsRevoked() || ctx.Err() != nil {
+		return
 	}
 
 	// Sort characters by level (descending), then by item level (descending)
@@ -612,42 +740,54 @@ func fetchCharacterData() {
 	// Fetch account-wide collections (mounts & pets)
 	var mountsCollected, petsCollected int
 
-	mountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/mounts?namespace=%s&locale=%s",
-		config.Region, config.ProfileNamespace(), config.Locale)
-	if mountsResp, err := client.Get(mountsURL); err == nil {
-		defer mountsResp.Body.Close()
-		if mountsResp.StatusCode == 200 {
-			var mountsData struct {
-				Mounts []interface{} `json:"mounts"`
+	if !session.IsRevoked() && ctx.Err() == nil {
+		mountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/mounts?namespace=%s&locale=%s",
+			config.Region, config.ProfileNamespace(), config.Locale)
+		if mountsResp, err := httpGetWithContext(ctx, client, mountsURL); err == nil {
+			defer mountsResp.Body.Close()
+			if mountsResp.StatusCode == 200 {
+				var mountsData struct {
+					Mounts []interface{} `json:"mounts"`
+				}
+				if err := json.NewDecoder(mountsResp.Body).Decode(&mountsData); err == nil {
+					mountsCollected = len(mountsData.Mounts)
+					log.Printf("Mounts collected: %d", mountsCollected)
+				}
+			} else {
+				log.Printf("Mounts endpoint returned HTTP %d", mountsResp.StatusCode)
 			}
-			if err := json.NewDecoder(mountsResp.Body).Decode(&mountsData); err == nil {
-				mountsCollected = len(mountsData.Mounts)
-				log.Printf("Mounts collected: %d", mountsCollected)
-			}
-		} else {
-			log.Printf("Mounts endpoint returned HTTP %d", mountsResp.StatusCode)
 		}
 	}
 
-	petsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/pets?namespace=%s&locale=%s",
-		config.Region, config.ProfileNamespace(), config.Locale)
-	if petsResp, err := client.Get(petsURL); err == nil {
-		defer petsResp.Body.Close()
-		if petsResp.StatusCode == 200 {
-			var petsData struct {
-				Pets []interface{} `json:"pets"`
+	if !session.IsRevoked() && ctx.Err() == nil {
+		petsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/pets?namespace=%s&locale=%s",
+			config.Region, config.ProfileNamespace(), config.Locale)
+		if petsResp, err := httpGetWithContext(ctx, client, petsURL); err == nil {
+			defer petsResp.Body.Close()
+			if petsResp.StatusCode == 200 {
+				var petsData struct {
+					Pets []interface{} `json:"pets"`
+				}
+				if err := json.NewDecoder(petsResp.Body).Decode(&petsData); err == nil {
+					petsCollected = len(petsData.Pets)
+					log.Printf("Pets collected: %d", petsCollected)
+				}
+			} else {
+				log.Printf("Pets endpoint returned HTTP %d", petsResp.StatusCode)
 			}
-			if err := json.NewDecoder(petsResp.Body).Decode(&petsData); err == nil {
-				petsCollected = len(petsData.Pets)
-				log.Printf("Pets collected: %d", petsCollected)
-			}
-		} else {
-			log.Printf("Pets endpoint returned HTTP %d", petsResp.StatusCode)
 		}
 	}
 
-	summaryMutex.Lock()
-	accountSummary = AccountSummary{
+	if session.IsRevoked() || ctx.Err() != nil {
+		return
+	}
+
+	session.mu.Lock()
+	if session.revoked {
+		session.mu.Unlock()
+		return
+	}
+	session.Summary = AccountSummary{
 		Characters:      allCharacters,
 		TotalGold:       totalGold,
 		MountsCollected: mountsCollected,
@@ -658,21 +798,33 @@ func fetchCharacterData() {
 		Authenticated:   true,
 		Error:           "",
 	}
-	snapshot := accountSummary // copy before unlock
-	summaryMutex.Unlock()
+	snapshot := session.Summary
+	currAccountID := session.AccountID
+	session.mu.Unlock()
 
-	// Persist snapshot asynchronously — never blocks the UI
-	go saveSnapshot(snapshot)
+	// Persist snapshot asynchronously — scoped to currAccountID
+	if currAccountID != "" {
+		go saveSnapshot(snapshot, currAccountID)
+	}
 
-	log.Printf("Data updated. Found %d characters (%d Horde, %d Alliance). Total gold: %s. Mounts: %d, Pets: %d",
-		len(allCharacters), hordeCount, allianceCount, formatGold(totalGold), mountsCollected, petsCollected)
+	log.Printf("Data updated for account %s. Found %d characters (%d Horde, %d Alliance). Total gold: %s. Mounts: %d, Pets: %d",
+		currAccountID, len(allCharacters), hordeCount, allianceCount, formatGold(totalGold), mountsCollected, petsCollected)
 }
 
 func fetchCharacterDetails(client *http.Client, realm, name, protectedHref string) CharacterStats {
+	return fetchCharacterDetailsWithContext(context.Background(), client, realm, name, protectedHref)
+}
+
+func fetchCharacterDetailsWithContext(ctx context.Context, client *http.Client, realm, name, protectedHref string) CharacterStats {
 	stats := CharacterStats{
 		Name:       name,
 		Realm:      realm,
 		LastUpdate: time.Now(),
+	}
+
+	if ctx.Err() != nil {
+		stats.Error = "canceled"
+		return stats
 	}
 
 	// Normalize name and realm to lowercase
@@ -684,7 +836,7 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 
 	log.Printf("Fetching profile: %s", profileURL)
 
-	resp, err := client.Get(profileURL)
+	resp, err := httpGetWithContext(ctx, client, profileURL)
 	if err != nil {
 		stats.Error = fmt.Sprintf("API error: %v", err)
 		log.Printf("Error fetching %s-%s: %v", realm, name, err)
@@ -724,18 +876,21 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 		stats.LastLogin = int64(lastLogin)
 	}
 
+	if ctx.Err() != nil {
+		stats.Error = "canceled"
+		return stats
+	}
+
 	// Extract character thumbnail/avatar
 	if media, ok := profile["media"].(map[string]interface{}); ok {
 		if href, ok := media["href"].(string); ok {
-			// Fetch media/avatar
-			mediaResp, err := client.Get(href)
+			mediaResp, err := httpGetWithContext(ctx, client, href)
 			if err == nil {
 				defer mediaResp.Body.Close()
 				if mediaResp.StatusCode == http.StatusOK {
 					var mediaData map[string]interface{}
 					if err := json.NewDecoder(mediaResp.Body).Decode(&mediaData); err == nil {
 						if assets, ok := mediaData["assets"].([]interface{}); ok && len(assets) > 0 {
-							// Get the avatar (usually first asset or look for key "avatar")
 							for _, asset := range assets {
 								if assetMap, ok := asset.(map[string]interface{}); ok {
 									if key, ok := assetMap["key"].(string); ok && key == "avatar" {
@@ -746,7 +901,6 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 									}
 								}
 							}
-							// Fallback to first asset if no avatar found
 							if stats.ThumbnailURL == "" {
 								if firstAsset, ok := assets[0].(map[string]interface{}); ok {
 									if value, ok := firstAsset["value"].(string); ok {
@@ -761,10 +915,15 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 		}
 	}
 
+	if ctx.Err() != nil {
+		stats.Error = "canceled"
+		return stats
+	}
+
 	// Fetch professions
 	professionsURL := characterURL(normalizedRealm, normalizedName, "/professions")
 
-	profResp, err := client.Get(professionsURL)
+	profResp, err := httpGetWithContext(ctx, client, professionsURL)
 	if err == nil {
 		defer profResp.Body.Close()
 		if profResp.StatusCode == http.StatusOK {
@@ -782,7 +941,6 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 								profession.Name = n
 							}
 						}
-						// Capture every expansion tier (oldest → newest)
 						if tiers, ok := prof["tiers"].([]interface{}); ok {
 							for _, t := range tiers {
 								tier, ok := t.(map[string]interface{})
@@ -819,19 +977,22 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 		}
 	}
 
+	if ctx.Err() != nil {
+		stats.Error = "canceled"
+		return stats
+	}
+
 	// Try to fetch gold from the protected character endpoint
 	if protectedHref != "" {
 		log.Printf("Fetching protected data: %s", protectedHref)
-		protectedResp, err := client.Get(protectedHref)
+		protectedResp, err := httpGetWithContext(ctx, client, protectedHref)
 		if err == nil {
 			defer protectedResp.Body.Close()
 			if protectedResp.StatusCode == http.StatusOK {
 				var protectedData map[string]interface{}
 				if err := json.NewDecoder(protectedResp.Body).Decode(&protectedData); err == nil {
-					// Log what's available in protected endpoint
 					log.Printf("Protected character data keys for %s: %v", name, getKeys(protectedData))
 
-					// Try to find gold/money field
 					if money, ok := protectedData["money"].(float64); ok {
 						stats.Gold = int64(money)
 						log.Printf("Character %s-%s: Gold from protected = %s", realm, name, formatGold(int64(money)))
@@ -842,8 +1003,6 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 						log.Printf("Character %s-%s: No money/gold in protected endpoint", realm, name)
 					}
 
-					// Attempt to extract currency-like structures from protectedData
-					// Some characters expose currencies in arrays under keys like 'currencies' or 'currency'
 					tryKeys := []string{"currencies", "currency", "currency_list", "currencies_owned", "currenciesOwned"}
 					stats.Currencies = make(map[int64]int64)
 					stats.CurrencyNames = make(map[int64]string)
@@ -883,7 +1042,6 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 										}
 									}
 								}
-								// If we extracted something, stop looking
 								if len(stats.Currencies) > 0 {
 									log.Printf("Extracted %d currencies from protected data for %s-%s", len(stats.Currencies), name, realm)
 									break
@@ -898,9 +1056,14 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 		}
 	}
 
+	if ctx.Err() != nil {
+		stats.Error = "canceled"
+		return stats
+	}
+
 	// Fetch last raid kill
 	raidsURL := characterURL(normalizedRealm, normalizedName, "/encounters/raids")
-	raidsResp, err := client.Get(raidsURL)
+	raidsResp, err := httpGetWithContext(ctx, client, raidsURL)
 	if err == nil {
 		defer raidsResp.Body.Close()
 		if raidsResp.StatusCode == http.StatusOK {
@@ -1113,9 +1276,13 @@ func fetchCharacterCurrencies(client *http.Client, realm, name string, desiredID
 
 // handlePlayerCurrency renders a page showing requested currencies per-character.
 func handlePlayerCurrency(w http.ResponseWriter, r *http.Request) {
-	summaryMutex.RLock()
-	data := accountSummary
-	summaryMutex.RUnlock()
+	session := getSession(r)
+	var data AccountSummary
+	var tkn *oauth2.Token
+	if session != nil {
+		data = session.GetSummary()
+		tkn = session.GetToken()
+	}
 
 	// Desired currency names (user-specified)
 	desired := []string{"Dawncrests", "Radiant Spark Dust", "Dawnlight Manaflux", "Coffer Key Shards", "Restored Coffer Keys", "Voidlight Marl"}
@@ -1124,13 +1291,9 @@ func handlePlayerCurrency(w http.ResponseWriter, r *http.Request) {
 	nameToID := resolveCurrencyIDs(desired)
 
 	// Ensure CharacterStats has Currencies and CurrencyNames populated for current snapshot
-	// We'll use the existing OAuth token to fetch character currencies per-character
-	tokenMutex.RLock()
-	tkn := userToken
-	tokenMutex.RUnlock()
-
+	// We'll use the user's OAuth token to fetch character currencies per-character
 	if tkn != nil {
-		ctx := context.Background()
+		ctx := r.Context()
 		client := oauth2Config.Client(ctx, tkn)
 		for i := range data.Characters {
 			ch := &data.Characters[i]
@@ -1227,27 +1390,19 @@ func BuildPlayerCurrencyTemplate(lang, currentPath string) string {
 var playerCurrencyTemplate = BuildPlayerCurrencyTemplate(LangEn, "/player-currency")
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
-	// Check whether the stored token has expired; if so, clear it so the
-	// login prompt is shown instead of stale/broken data.
-	tokenMutex.RLock()
-	tok := userToken
-	tokenMutex.RUnlock()
-
-	if tok != nil && !tok.Valid() {
-		tokenMutex.Lock()
-		userToken = nil
-		tokenMutex.Unlock()
-
-		summaryMutex.Lock()
-		accountSummary = AccountSummary{Authenticated: false}
-		summaryMutex.Unlock()
-
-		log.Println("OAuth token expired — clearing session")
+	session := getSession(r)
+	var data AccountSummary
+	if session != nil {
+		session.mu.Lock()
+		if session.Token != nil && !session.Token.Valid() {
+			session.Token = nil
+			session.Authenticated = false
+			session.Summary.Authenticated = false
+			log.Println("OAuth token expired — clearing session")
+		}
+		data = session.Summary
+		session.mu.Unlock()
 	}
-
-	summaryMutex.RLock()
-	data := accountSummary
-	summaryMutex.RUnlock()
 
 	lang := ResolveLanguage(r)
 	tmpl := template.Must(template.New("index").Funcs(template.FuncMap{
@@ -1272,31 +1427,41 @@ func handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clearExtraCaches()
-	// Run in background so the browser isn't left waiting for all API calls to finish
-	go fetchCharacterData()
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	session.ClearExtraCaches()
+	if session == legacySession {
+		clearExtraCaches()
+	}
+
+	// Run in background for this specific session and account context
+	go fetchCharacterDataForSession(session)
 
 	http.Redirect(w, r, "/?refreshing=true", http.StatusSeeOther)
 }
 
 func handleAPIStats(w http.ResponseWriter, r *http.Request) {
-	summaryMutex.RLock()
-	data := accountSummary
-	summaryMutex.RUnlock()
+	session := getSession(r)
+	var data AccountSummary
+	if session != nil {
+		data = session.GetSummary()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
 }
 
 func handleDebugRaids(w http.ResponseWriter, r *http.Request) {
-	tokenMutex.RLock()
-	token := userToken
-	tokenMutex.RUnlock()
-
-	if token == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Error(w, "Not authenticated", http.StatusUnauthorized)
 		return
 	}
+	token := session.GetToken()
 
 	// Default to axefury on the-maelstrom, allow override via query params
 	realm := r.URL.Query().Get("realm")
@@ -1308,7 +1473,7 @@ func handleDebugRaids(w http.ResponseWriter, r *http.Request) {
 		name = "axefury"
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	client := oauth2Config.Client(ctx, token)
 
 	url := characterURL(realm, name, "/encounters/raids")
@@ -1335,14 +1500,12 @@ func handleDebugRaids(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugCharacterCurrencies returns the raw currencies payload from the Blizzard Profile API
 func handleDebugCharacterCurrencies(w http.ResponseWriter, r *http.Request) {
-	tokenMutex.RLock()
-	tok := userToken
-	tokenMutex.RUnlock()
-
-	if tok == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Error(w, "Not authenticated", http.StatusUnauthorized)
 		return
 	}
+	tok := session.GetToken()
 
 	realm := r.URL.Query().Get("realm")
 	name := r.URL.Query().Get("name")
@@ -1351,7 +1514,7 @@ func handleDebugCharacterCurrencies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	// Create an HTTP client that ignores environment proxies to avoid accidental
 	// proxying back to our local server (which can cause recursive HTML responses).
 	tr := &http.Transport{Proxy: nil}
@@ -1400,16 +1563,14 @@ func handleDebugCharacterCurrencies(w http.ResponseWriter, r *http.Request) {
 
 // handleDebugAccounts fetches the account-level profile data (profile/user/wow)
 func handleDebugAccounts(w http.ResponseWriter, r *http.Request) {
-	tokenMutex.RLock()
-	tok := userToken
-	tokenMutex.RUnlock()
-
-	if tok == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Error(w, "Not authenticated", http.StatusUnauthorized)
 		return
 	}
+	tok := session.GetToken()
 
-	ctx := context.Background()
+	ctx := r.Context()
 	tr := &http.Transport{Proxy: nil}
 	client := &http.Client{Transport: tr}
 	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=%s&locale=%s", config.Region, config.ProfileNamespace(), config.Locale)
@@ -1441,14 +1602,12 @@ func handleDebugAccounts(w http.ResponseWriter, r *http.Request) {
 // so we can see exactly what Blizzard returns, including error bodies on 404.
 // Usage: /debug/profile?realm=the-maelstrom&name=cesard
 func handleDebugProfile(w http.ResponseWriter, r *http.Request) {
-	tokenMutex.RLock()
-	token := userToken
-	tokenMutex.RUnlock()
-
-	if token == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Error(w, "Not authenticated", http.StatusUnauthorized)
 		return
 	}
+	token := session.GetToken()
 
 	realm := r.URL.Query().Get("realm")
 	name := r.URL.Query().Get("name")
@@ -1457,7 +1616,7 @@ func handleDebugProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	client := oauth2Config.Client(ctx, token)
 
 	url := characterURL(realm, name, "")
@@ -1481,14 +1640,12 @@ func handleDebugProfile(w http.ResponseWriter, r *http.Request) {
 // handleDebugProtected fetches a given protected-character href (passed via ?href=)
 // and returns the raw body; useful for inspecting protected payloads (currencies, houses, etc).
 func handleDebugProtected(w http.ResponseWriter, r *http.Request) {
-	tokenMutex.RLock()
-	tok := userToken
-	tokenMutex.RUnlock()
-
-	if tok == nil {
+	session := getSession(r)
+	if session == nil || !session.IsAuthenticated() {
 		http.Error(w, "Not authenticated", http.StatusUnauthorized)
 		return
 	}
+	tok := session.GetToken()
 
 	href := r.URL.Query().Get("href")
 	if href == "" {
@@ -1502,7 +1659,7 @@ func handleDebugProtected(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	tr := &http.Transport{Proxy: nil}
 	client := &http.Client{Transport: tr}
 	req, _ := http.NewRequestWithContext(ctx, "GET", href, nil)
@@ -1523,9 +1680,11 @@ func handleDebugProtected(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleVault(w http.ResponseWriter, r *http.Request) {
-	summaryMutex.RLock()
-	summary := accountSummary
-	summaryMutex.RUnlock()
+	session := getSession(r)
+	var summary AccountSummary
+	if session != nil {
+		summary = session.GetSummary()
+	}
 
 	lang := ResolveLanguage(r)
 	tmpl, err := template.New("vault").Funcs(template.FuncMap{
@@ -1545,9 +1704,11 @@ func handleVault(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleRoster(w http.ResponseWriter, r *http.Request) {
-	summaryMutex.RLock()
-	summary := accountSummary
-	summaryMutex.RUnlock()
+	session := getSession(r)
+	var summary AccountSummary
+	if session != nil {
+		summary = session.GetSummary()
+	}
 
 	lang := ResolveLanguage(r)
 	tmpl, err := template.New("roster").Funcs(template.FuncMap{
@@ -1567,9 +1728,11 @@ func handleRoster(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProfessions(w http.ResponseWriter, r *http.Request) {
-	summaryMutex.RLock()
-	summary := accountSummary
-	summaryMutex.RUnlock()
+	session := getSession(r)
+	var summary AccountSummary
+	if session != nil {
+		summary = session.GetSummary()
+	}
 
 	lang := ResolveLanguage(r)
 	tmpl, err := template.New("professions").Funcs(template.FuncMap{
@@ -1597,17 +1760,21 @@ type HistoryPageData struct {
 }
 
 func handleHistory(w http.ResponseWriter, r *http.Request) {
+	session := getSession(r)
 	data := HistoryPageData{DBEnabled: db != nil}
 
-	if db != nil {
-		var err error
-		data.AccountHistory, err = getAccountHistory()
-		if err != nil {
-			log.Printf("History: account query failed: %v", err)
-		}
-		data.CharHistories, err = getCharacterHistories()
-		if err != nil {
-			log.Printf("History: character query failed: %v", err)
+	if db != nil && session != nil && session.IsAuthenticated() {
+		accID := session.GetAccountID()
+		if accID != "" {
+			var err error
+			data.AccountHistory, err = getAccountHistory(accID)
+			if err != nil {
+				log.Printf("History: account query failed: %v", err)
+			}
+			data.CharHistories, err = getCharacterHistories(accID)
+			if err != nil {
+				log.Printf("History: character query failed: %v", err)
+			}
 		}
 	}
 
