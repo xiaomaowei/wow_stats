@@ -28,10 +28,30 @@ type Config struct {
 	Locale       string
 	Port         string
 	RedirectURL  string
+	GameVersion  string // "retail" (default) or "forever"
+}
+
+func (c Config) IsForever() bool {
+	return strings.EqualFold(strings.TrimSpace(c.GameVersion), "forever")
+}
+
+func (c Config) ProfileNamespace() string {
+	if c.IsForever() {
+		return fmt.Sprintf("profile-forever-%s", c.Region)
+	}
+	return fmt.Sprintf("profile-%s", c.Region)
+}
+
+func (c Config) StaticNamespace() string {
+	if c.IsForever() {
+		return fmt.Sprintf("static-forever-%s", c.Region)
+	}
+	return fmt.Sprintf("static-%s", c.Region)
 }
 
 type CharacterStats struct {
 	Name             string
+	Surname          string
 	Realm            string
 	Level            int
 	ItemLevel        int
@@ -80,6 +100,7 @@ type AccountSummary struct {
 	AllianceCount   int
 	LastUpdate      time.Time
 	Authenticated   bool
+	Error           string
 }
 
 var (
@@ -94,6 +115,14 @@ var (
 	currencyCacheMutex sync.RWMutex
 )
 
+func parseGameVersion(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "forever" || v == "classic_forever" || v == "wow_forever" {
+		return "forever"
+	}
+	return "retail"
+}
+
 func main() {
 	// Load environment variables
 	if err := godotenv.Load(); err != nil {
@@ -104,6 +133,17 @@ func main() {
 	port := getEnvOrDefault("PORT", "8080")
 	region := getEnvOrDefault("REGION", "us")
 
+	gameVersion := parseGameVersion(os.Getenv("WOW_GAME_VERSION"))
+	if gameVersion == "retail" {
+		if f := os.Getenv("WOW_FLAVOR"); f != "" {
+			gameVersion = parseGameVersion(f)
+		} else if m := os.Getenv("WOW_MODE"); m != "" {
+			gameVersion = parseGameVersion(m)
+		} else if os.Getenv("WOW_FOREVER") == "true" || os.Getenv("WOW_FOREVER") == "1" {
+			gameVersion = "forever"
+		}
+	}
+
 	config = Config{
 		ClientID:     os.Getenv("BLIZZARD_CLIENT_ID"),
 		ClientSecret: os.Getenv("BLIZZARD_CLIENT_SECRET"),
@@ -111,6 +151,7 @@ func main() {
 		Locale:       getEnvOrDefault("LOCALE", "en_US"),
 		Port:         port,
 		RedirectURL:  fmt.Sprintf("http://localhost:%s/callback", port),
+		GameVersion:  gameVersion,
 	}
 	InitUILanguage(config.Locale, os.Getenv("UI_LOCALE"))
 
@@ -169,6 +210,7 @@ func main() {
 	// Start server
 	addr := ":" + config.Port
 	log.Printf("Server starting on %s", addr)
+	log.Printf("Game version: %s, Profile namespace: %s, Region: %s", config.GameVersion, config.ProfileNamespace(), config.Region)
 	log.Printf("Open http://localhost%s in your browser", addr)
 	log.Printf("OAuth Redirect URL: %s", config.RedirectURL)
 	log.Printf("Make sure this URL is configured in your Blizzard Developer Portal!")
@@ -233,6 +275,174 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?loading=true", http.StatusSeeOther)
 }
 
+type rawAccountCharacter struct {
+	Name     string `json:"name"`
+	Surname  string `json:"surname"`
+	LastName string `json:"last_name"`
+	ID       int64  `json:"id"`
+	Level    int    `json:"level"`
+	Realm    struct {
+		Slug string `json:"slug"`
+		Name string `json:"name"`
+		ID   int64  `json:"id"`
+	} `json:"realm"`
+	Ruleset struct {
+		Slug string `json:"slug"`
+		Name string `json:"name"`
+		ID   int64  `json:"id"`
+	} `json:"ruleset"`
+	PlayableClass struct {
+		Name string `json:"name"`
+		ID   int64  `json:"id"`
+	} `json:"playable_class"`
+	PlayableRace struct {
+		Name string `json:"name"`
+		ID   int64  `json:"id"`
+	} `json:"playable_race"`
+	Gender struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"gender"`
+	Faction struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"faction"`
+	ProtectedCharacter struct {
+		Href string `json:"href"`
+	} `json:"protected_character"`
+	Character struct {
+		Href string `json:"href"`
+	} `json:"character"`
+}
+
+type DiscoveredCharacter struct {
+	Name          string
+	Surname       string
+	FullName      string
+	RealmSlug     string
+	RealmName     string
+	Level         int
+	Class         string
+	Race          string
+	Faction       string
+	ProtectedHref string
+	CharacterHref string
+}
+
+// buildForeverFullName combines a character's first name and surname without duplicating the surname.
+func buildForeverFullName(firstName, surname string) string {
+	firstName = strings.TrimSpace(firstName)
+	surname = strings.TrimSpace(surname)
+	if surname == "" {
+		return firstName
+	}
+	if firstName == "" {
+		return surname
+	}
+
+	fLower := strings.ToLower(firstName)
+	sLower := strings.ToLower(surname)
+
+	// If firstName already equals surname, return firstName
+	if fLower == sLower {
+		return firstName
+	}
+
+	// Check if surname is already a word in firstName
+	words := strings.Fields(firstName)
+	for _, w := range words {
+		if strings.ToLower(w) == sLower {
+			return firstName
+		}
+	}
+
+	// Check if hyphenated inside firstName
+	for _, p := range strings.Split(firstName, "-") {
+		if strings.ToLower(strings.TrimSpace(p)) == sLower {
+			return firstName
+		}
+	}
+
+	// Check if firstName ends with surname (e.g. compound name)
+	if strings.HasSuffix(fLower, sLower) {
+		return firstName
+	}
+
+	return firstName + " " + surname
+}
+
+func parseAccountCharacters(body []byte, isForever bool) ([]DiscoveredCharacter, error) {
+	var resp struct {
+		WoWAccounts []struct {
+			ID         int64                 `json:"id"`
+			Characters []rawAccountCharacter `json:"characters"`
+		} `json:"wow_accounts"`
+		Characters []rawAccountCharacter `json:"characters"`
+	}
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+
+	var rawList []rawAccountCharacter
+	for _, acc := range resp.WoWAccounts {
+		rawList = append(rawList, acc.Characters...)
+	}
+	if len(rawList) == 0 && len(resp.Characters) > 0 {
+		rawList = append(rawList, resp.Characters...)
+	}
+
+	var out []DiscoveredCharacter
+	for _, ch := range rawList {
+		firstName := strings.TrimSpace(ch.Name)
+		surname := strings.TrimSpace(ch.Surname)
+		if surname == "" {
+			surname = strings.TrimSpace(ch.LastName)
+		}
+
+		var fullName string
+		if isForever {
+			fullName = buildForeverFullName(firstName, surname)
+		} else {
+			fullName = firstName
+		}
+
+		realmSlug := strings.TrimSpace(ch.Realm.Slug)
+		realmName := strings.TrimSpace(ch.Realm.Name)
+		if isForever {
+			if realmName == "" && ch.Ruleset.Name != "" {
+				realmName = ch.Ruleset.Name
+			}
+			if realmSlug == "" && ch.Ruleset.Slug != "" {
+				realmSlug = ch.Ruleset.Slug
+			}
+			if realmName == "" && realmSlug != "" {
+				realmName = realmSlug
+			}
+		} else {
+			if realmName == "" && realmSlug != "" {
+				realmName = realmSlug
+			}
+		}
+
+		out = append(out, DiscoveredCharacter{
+			Name:          firstName,
+			Surname:       surname,
+			FullName:      fullName,
+			RealmSlug:     realmSlug,
+			RealmName:     realmName,
+			Level:         ch.Level,
+			Class:         ch.PlayableClass.Name,
+			Race:          ch.PlayableRace.Name,
+			Faction:       ch.Faction.Type,
+			ProtectedHref: ch.ProtectedCharacter.Href,
+			CharacterHref: ch.Character.Href,
+		})
+	}
+
+	return out, nil
+}
+
 func fetchCharacterData() {
 	tokenMutex.RLock()
 	token := userToken
@@ -253,56 +463,53 @@ func fetchCharacterData() {
 	client := oauth2Config.Client(ctx, token)
 
 	// Fetch WoW account list
-	accountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=profile-%s&locale=%s",
-		config.Region, config.Region, config.Locale)
-
-	var accountsResp struct {
-		WoWAccounts []struct {
-			ID         int64 `json:"id"`
-			Characters []struct {
-				Name  string `json:"name"`
-				ID    int64  `json:"id"`
-				Level int    `json:"level"`
-				Realm struct {
-					Slug string `json:"slug"`
-					Name string `json:"name"`
-				} `json:"realm"`
-				PlayableClass struct {
-					Name string `json:"name"`
-				} `json:"playable_class"`
-				PlayableRace struct {
-					Name string `json:"name"`
-				} `json:"playable_race"`
-				Faction struct {
-					Type string `json:"type"`
-					Name string `json:"name"`
-				} `json:"faction"`
-				ProtectedCharacter struct {
-					Href string `json:"href"`
-				} `json:"protected_character"`
-			} `json:"characters"`
-		} `json:"wow_accounts"`
-	}
+	accountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=%s&locale=%s",
+		config.Region, config.ProfileNamespace(), config.Locale)
 
 	resp, err := client.Get(accountsURL)
 	if err != nil {
 		log.Printf("Error fetching WoW accounts: %v", err)
+		summaryMutex.Lock()
+		accountSummary.Error = fmt.Sprintf("API error: %v", err)
+		accountSummary.LastUpdate = time.Now()
+		summaryMutex.Unlock()
 		return
 	}
 	defer resp.Body.Close()
 
-	// Decode directly into our struct
-	if err := json.NewDecoder(resp.Body).Decode(&accountsResp); err != nil {
-		log.Printf("Error decoding accounts response: %v", err)
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("Error fetching WoW accounts: HTTP %d (URL: %s): %s", resp.StatusCode, accountsURL, string(bodyBytes))
+		summaryMutex.Lock()
+		accountSummary.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		accountSummary.LastUpdate = time.Now()
+		summaryMutex.Unlock()
 		return
 	}
 
-	log.Printf("Found %d WoW accounts", len(accountsResp.WoWAccounts))
-	for i, acc := range accountsResp.WoWAccounts {
-		log.Printf("Account %d (ID: %d) has %d characters", i, acc.ID, len(acc.Characters))
-		for _, ch := range acc.Characters {
-			log.Printf("  character: name='%s', realm='%s', level=%d", ch.Name, ch.Realm.Slug, ch.Level)
-		}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading accounts response: %v", err)
+		summaryMutex.Lock()
+		accountSummary.Error = fmt.Sprintf("Read error: %v", err)
+		accountSummary.LastUpdate = time.Now()
+		summaryMutex.Unlock()
+		return
+	}
+
+	discovered, err := parseAccountCharacters(bodyBytes, config.IsForever())
+	if err != nil {
+		log.Printf("Error decoding accounts response: %v", err)
+		summaryMutex.Lock()
+		accountSummary.Error = fmt.Sprintf("Decode error: %v", err)
+		accountSummary.LastUpdate = time.Now()
+		summaryMutex.Unlock()
+		return
+	}
+
+	log.Printf("Found %d characters across accounts", len(discovered))
+	for _, ch := range discovered {
+		log.Printf("  character: name='%s', surname='%s', realm='%s', level=%d", ch.Name, ch.Surname, ch.RealmSlug, ch.Level)
 	}
 
 	// Collect all characters from all WoW accounts
@@ -313,48 +520,55 @@ func fetchCharacterData() {
 	// Rate limiting: Max 10 concurrent requests
 	semaphore := make(chan struct{}, 10)
 
-	for _, account := range accountsResp.WoWAccounts {
-		for _, charData := range account.Characters {
-			wg.Add(1)
-			go func(cd struct {
-				Name  string `json:"name"`
-				ID    int64  `json:"id"`
-				Level int    `json:"level"`
-				Realm struct {
-					Slug string `json:"slug"`
-					Name string `json:"name"`
-				} `json:"realm"`
-				PlayableClass struct {
-					Name string `json:"name"`
-				} `json:"playable_class"`
-				PlayableRace struct {
-					Name string `json:"name"`
-				} `json:"playable_race"`
-				Faction struct {
-					Type string `json:"type"`
-					Name string `json:"name"`
-				} `json:"faction"`
-				ProtectedCharacter struct {
-					Href string `json:"href"`
-				} `json:"protected_character"`
-			}) {
-				defer wg.Done()
+	for _, cd := range discovered {
+		wg.Add(1)
+		go func(char DiscoveredCharacter) {
+			defer wg.Done()
 
-				// Acquire semaphore
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
 
-				// Small delay to avoid rate limiting
-				time.Sleep(100 * time.Millisecond)
+			// Small delay to avoid rate limiting
+			time.Sleep(100 * time.Millisecond)
 
-				stats := fetchCharacterDetails(client, cd.Realm.Slug, cd.Name, cd.ProtectedCharacter.Href)
-				stats.Level = cd.Level
-				stats.Class = cd.PlayableClass.Name
-				stats.Race = cd.PlayableRace.Name
-				stats.Faction = cd.Faction.Type
-				statsChan <- stats
-			}(charData)
-		}
+			lookupRealm := char.RealmSlug
+			lookupName := char.Name
+			if config.IsForever() {
+				lookupRealm = ""
+				if char.FullName != "" {
+					lookupName = char.FullName
+				} else if char.Surname != "" {
+					lookupName = buildForeverFullName(char.Name, char.Surname)
+				}
+			}
+
+			stats := fetchCharacterDetails(client, lookupRealm, lookupName, char.ProtectedHref)
+			if config.IsForever() && char.FullName != "" {
+				stats.Name = char.FullName
+				stats.Surname = char.Surname
+			} else {
+				stats.Name = char.Name
+			}
+			if config.IsForever() {
+				if char.RealmName != "" {
+					stats.Realm = char.RealmName
+				} else {
+					stats.Realm = char.RealmSlug
+				}
+			} else {
+				if char.RealmSlug != "" {
+					stats.Realm = char.RealmSlug
+				} else {
+					stats.Realm = char.RealmName
+				}
+			}
+			stats.Level = char.Level
+			stats.Class = char.Class
+			stats.Race = char.Race
+			stats.Faction = char.Faction
+			statsChan <- stats
+		}(cd)
 	}
 
 	go func() {
@@ -365,7 +579,8 @@ func fetchCharacterData() {
 	for stats := range statsChan {
 		// Characters below level 10 return 404 from the profile API.
 		// Keep them but mark them so we can show a minimal stub card.
-		if stats.Error == "HTTP 404" {
+		// If level >= 10, an HTTP 404 is an API error and should not be disguised as below_level_10.
+		if stats.Error == "HTTP 404" && stats.Level < 10 {
 			log.Printf("Stub card for %s-%s (below level 10, no profile data available)", stats.Realm, stats.Name)
 			stats.Error = "below_level_10"
 		}
@@ -397,8 +612,8 @@ func fetchCharacterData() {
 	// Fetch account-wide collections (mounts & pets)
 	var mountsCollected, petsCollected int
 
-	mountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/mounts?namespace=profile-%s&locale=%s",
-		config.Region, config.Region, config.Locale)
+	mountsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/mounts?namespace=%s&locale=%s",
+		config.Region, config.ProfileNamespace(), config.Locale)
 	if mountsResp, err := client.Get(mountsURL); err == nil {
 		defer mountsResp.Body.Close()
 		if mountsResp.StatusCode == 200 {
@@ -414,8 +629,8 @@ func fetchCharacterData() {
 		}
 	}
 
-	petsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/pets?namespace=profile-%s&locale=%s",
-		config.Region, config.Region, config.Locale)
+	petsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow/collections/pets?namespace=%s&locale=%s",
+		config.Region, config.ProfileNamespace(), config.Locale)
 	if petsResp, err := client.Get(petsURL); err == nil {
 		defer petsResp.Body.Close()
 		if petsResp.StatusCode == 200 {
@@ -441,6 +656,7 @@ func fetchCharacterData() {
 		AllianceCount:   allianceCount,
 		LastUpdate:      time.Now(),
 		Authenticated:   true,
+		Error:           "",
 	}
 	snapshot := accountSummary // copy before unlock
 	summaryMutex.Unlock()
@@ -464,8 +680,7 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 	normalizedRealm := strings.ToLower(realm)
 
 	// Fetch character profile for item level
-	profileURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s?namespace=profile-%s&locale=%s",
-		config.Region, normalizedRealm, normalizedName, config.Region, config.Locale)
+	profileURL := characterURL(normalizedRealm, normalizedName, "")
 
 	log.Printf("Fetching profile: %s", profileURL)
 
@@ -547,8 +762,7 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 	}
 
 	// Fetch professions
-	professionsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/professions?namespace=profile-%s&locale=%s",
-		config.Region, normalizedRealm, normalizedName, config.Region, config.Locale)
+	professionsURL := characterURL(normalizedRealm, normalizedName, "/professions")
 
 	profResp, err := client.Get(professionsURL)
 	if err == nil {
@@ -685,8 +899,7 @@ func fetchCharacterDetails(client *http.Client, realm, name, protectedHref strin
 	}
 
 	// Fetch last raid kill
-	raidsURL := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/encounters/raids?namespace=profile-%s&locale=%s",
-		config.Region, normalizedRealm, normalizedName, config.Region, config.Locale)
+	raidsURL := characterURL(normalizedRealm, normalizedName, "/encounters/raids")
 	raidsResp, err := client.Get(raidsURL)
 	if err == nil {
 		defer raidsResp.Body.Close()
@@ -794,7 +1007,7 @@ func resolveCurrencyIDs(names []string) map[string]int64 {
 	}
 
 	// Fetch currency index
-	idxURL := fmt.Sprintf("https://%s.api.blizzard.com/data/wow/currency/index?namespace=static-%s&locale=%s", config.Region, config.Region, config.Locale)
+	idxURL := fmt.Sprintf("https://%s.api.blizzard.com/data/wow/currency/index?namespace=%s&locale=%s", config.Region, config.StaticNamespace(), config.Locale)
 	req2, _ := http.NewRequest("GET", idxURL, nil)
 	req2.Header.Set("Authorization", "Bearer "+tokResp.AccessToken)
 
@@ -834,8 +1047,7 @@ func fetchCharacterCurrencies(client *http.Client, realm, name string, desiredID
 	res := make(map[int64]int64)
 	normalizedRealm := strings.ToLower(realm)
 	normalizedName := strings.ToLower(name)
-	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/currencies?namespace=profile-%s&locale=%s",
-		config.Region, normalizedRealm, normalizedName, config.Region, config.Locale)
+	url := characterURL(normalizedRealm, normalizedName, "/currencies")
 
 	resp, err := client.Get(url)
 	if err != nil {
@@ -1099,8 +1311,7 @@ func handleDebugRaids(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	client := oauth2Config.Client(ctx, token)
 
-	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/encounters/raids?namespace=profile-%s&locale=%s",
-		config.Region, realm, strings.ToLower(name), config.Region, config.Locale)
+	url := characterURL(realm, name, "/encounters/raids")
 
 	log.Printf("DEBUG raids URL: %s", url)
 	resp, err := client.Get(url)
@@ -1146,8 +1357,7 @@ func handleDebugCharacterCurrencies(w http.ResponseWriter, r *http.Request) {
 	tr := &http.Transport{Proxy: nil}
 	client := &http.Client{Transport: tr}
 
-	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s/currencies?namespace=profile-%s&locale=%s",
-		config.Region, strings.ToLower(realm), strings.ToLower(name), config.Region, config.Locale)
+	url := characterURL(realm, name, "/currencies")
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	// Attach the user's access token explicitly (we're not using oauth2 client here
@@ -1202,7 +1412,7 @@ func handleDebugAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	tr := &http.Transport{Proxy: nil}
 	client := &http.Client{Transport: tr}
-	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=profile-%s&locale=%s", config.Region, config.Region, config.Locale)
+	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/user/wow?namespace=%s&locale=%s", config.Region, config.ProfileNamespace(), config.Locale)
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	resp, err := client.Do(req)
@@ -1250,8 +1460,7 @@ func handleDebugProfile(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 	client := oauth2Config.Client(ctx, token)
 
-	url := fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s?namespace=profile-%s&locale=%s",
-		config.Region, strings.ToLower(realm), strings.ToLower(name), config.Region, config.Locale)
+	url := characterURL(realm, name, "")
 
 	log.Printf("DEBUG profile URL: %s", url)
 	resp, err := client.Get(url)
@@ -4342,11 +4551,20 @@ func BuildHomeTemplate(lang, currentPath string) string {
             <a href="/login" class="btn btn-primary">` + template.HTMLEscapeString(T(lang, "home.login_btn")) + `</a>
         </div>
         {{else}}
-        {{if eq (len .Characters) 0}}
+        {{if .Error}}
+        <div class="api-error-banner" style="background: rgba(180, 40, 40, 0.3); border: 1px solid #d05050; border-radius: 6px; padding: 15px; margin-bottom: 20px; text-align: center; color: #ffaaaa;">
+            <p>{{.Error}}</p>
+        </div>
+        {{end}}
+        {{if and (eq (len .Characters) 0) (not .Error)}}
         <div class="loading-message">
             <div class="spinner"></div>
             <p>` + template.HTMLEscapeString(T(lang, "home.loading_chars")) + `</p>
             <p style="opacity: 0.7; margin-top: 10px;">` + template.HTMLEscapeString(T(lang, "home.loading_auto_refresh")) + `</p>
+        </div>
+        {{else if and (eq (len .Characters) 0) .Error}}
+        <div class="empty-state" style="text-align: center; padding: 40px;">
+            <p style="font-size: 1.2em; opacity: 0.8;">No characters could be loaded due to API error.</p>
         </div>
         {{else}}
         <div class="summary">

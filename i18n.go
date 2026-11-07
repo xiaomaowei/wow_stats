@@ -991,6 +991,36 @@ var translations = map[string]map[string]string{
 		LangZhTW: "%s：寶石插槽未鑲嵌",
 	},
 
+	// Equipment Tooltip Labels
+	"equip.tt_item_level": {
+		LangEn:   "Item Level %s",
+		LangZhTW: "物品等級 %s",
+	},
+	"equip.tt_armor": {
+		LangEn:   "%d Armor",
+		LangZhTW: "%d 點護甲",
+	},
+	"equip.tt_weapon_speed": {
+		LangEn:   "Speed %s",
+		LangZhTW: "速度 %s",
+	},
+	"equip.tt_requires_level": {
+		LangEn:   "Requires Level %d",
+		LangZhTW: "需要等級 %d",
+	},
+	"equip.tt_socket_prefix": {
+		LangEn:   "Socket",
+		LangZhTW: "插槽",
+	},
+	"equip.tt_empty_socket": {
+		LangEn:   "Empty Socket",
+		LangZhTW: "空插槽",
+	},
+	"equip.tt_set_prefix": {
+		LangEn:   "Set: %s",
+		LangZhTW: "套裝：%s",
+	},
+
 	// Slot names
 	"slot.HEAD":      {LangEn: "Head", LangZhTW: "頭部"},
 	"slot.NECK":      {LangEn: "Neck", LangZhTW: "項鍊"},
@@ -1229,27 +1259,23 @@ func LanguageSelectorHTML(currentLang, currentPath string) template.HTML {
 
 // NavHTML returns the navigation menu buttons localized for current language
 func NavHTML(lang string) string {
-	return fmt.Sprintf(`<div class="header-nav-btns">
-    <a href="/" class="nav-btn">%s</a>
-    <a href="/vault" class="nav-btn nav-btn-vault"><img src="/images/vault-button.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>
-    <a href="/roster" class="nav-btn nav-btn-roster"><img src="/images/quest.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>
-    <a href="/professions" class="nav-btn nav-btn-prof"><img src="/images/professions.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>
-    <a href="/mythic-plus" class="nav-btn nav-btn-mplus"><img src="/images/dungeon.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>
-    <a href="/equipment" class="nav-btn nav-btn-gear">%s</a>
-    <a href="/achievements" class="nav-btn nav-btn-ach">%s</a>
-    <a href="/history" class="nav-btn nav-btn-history"><img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>
-    <a href="/logout" class="nav-btn nav-btn-logout">%s</a>
-  </div>`,
-		template.HTMLEscapeString(T(lang, "nav.home")),
-		template.HTMLEscapeString(T(lang, "nav.vault")),
-		template.HTMLEscapeString(T(lang, "nav.roster")),
-		template.HTMLEscapeString(T(lang, "nav.professions")),
-		template.HTMLEscapeString(T(lang, "nav.mythicplus")),
-		template.HTMLEscapeString(T(lang, "nav.equipment")),
-		template.HTMLEscapeString(T(lang, "nav.achievements")),
-		template.HTMLEscapeString(T(lang, "nav.history")),
-		template.HTMLEscapeString(T(lang, "nav.logout")),
-	)
+	var sb strings.Builder
+	sb.WriteString(`<div class="header-nav-btns">` + "\n")
+	sb.WriteString(fmt.Sprintf(`    <a href="/" class="nav-btn">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.home"))))
+	if !config.IsForever() {
+		sb.WriteString(fmt.Sprintf(`    <a href="/vault" class="nav-btn nav-btn-vault"><img src="/images/vault-button.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.vault"))))
+		sb.WriteString(fmt.Sprintf(`    <a href="/roster" class="nav-btn nav-btn-roster"><img src="/images/quest.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.roster"))))
+	}
+	sb.WriteString(fmt.Sprintf(`    <a href="/professions" class="nav-btn nav-btn-prof"><img src="/images/professions.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.professions"))))
+	if !config.IsForever() {
+		sb.WriteString(fmt.Sprintf(`    <a href="/mythic-plus" class="nav-btn nav-btn-mplus"><img src="/images/dungeon.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.mythicplus"))))
+	}
+	sb.WriteString(fmt.Sprintf(`    <a href="/equipment" class="nav-btn nav-btn-gear">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.equipment"))))
+	sb.WriteString(fmt.Sprintf(`    <a href="/achievements" class="nav-btn nav-btn-ach">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.achievements"))))
+	sb.WriteString(fmt.Sprintf(`    <a href="/history" class="nav-btn nav-btn-history"><img src="/images/progress.png" style="width:20px;height:20px;flex-shrink:0;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.6));" alt="">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.history"))))
+	sb.WriteString(fmt.Sprintf(`    <a href="/logout" class="nav-btn nav-btn-logout">%s</a>`+"\n", template.HTMLEscapeString(T(lang, "nav.logout"))))
+	sb.WriteString(`  </div>`)
+	return sb.String()
 }
 
 // BuildPageHead returns shared head markup parameterized by lang and title

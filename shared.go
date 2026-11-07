@@ -50,10 +50,44 @@ func getJSON(client *http.Client, url string, out interface{}) (int, error) {
 	return http.StatusTooManyRequests, fmt.Errorf("HTTP 429")
 }
 
-// profileURL builds a profile-namespace character URL. suffix may be "" or e.g. "/equipment".
+// formatCharacterSlug builds the hyphenated {name}-{surname} slug used by Forever character endpoints.
+// It formats full names (e.g. "Arthas Menethil" -> "arthas-menethil") and never appends ruleset or realm labels.
+func formatCharacterSlug(realm, name string) string {
+	name = strings.TrimSpace(name)
+	if strings.Contains(name, " ") {
+		fields := strings.Fields(name)
+		name = strings.Join(fields, "-")
+	}
+	// Deduplicate adjacent identical hyphenated segments if any (e.g. name-surname-surname)
+	parts := strings.Split(name, "-")
+	var dedup []string
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+		if len(dedup) > 0 && strings.EqualFold(dedup[len(dedup)-1], trimmed) {
+			continue
+		}
+		dedup = append(dedup, trimmed)
+	}
+	if len(dedup) > 0 {
+		return strings.ToLower(strings.Join(dedup, "-"))
+	}
+	return strings.ToLower(name)
+}
+
+// characterURL builds a profile-namespace character URL.
+// In Retail, it targets /profile/wow/character/{realm}/{name}{suffix}?namespace=profile-{region}&locale={locale}.
+// In Forever, it targets /profile/wow/character/{name}-{surname}{suffix}?namespace=profile-forever-{region}&locale={locale} without realm.
 func characterURL(realm, name, suffix string) string {
-	return fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s%s?namespace=profile-%s&locale=%s",
-		config.Region, strings.ToLower(realm), strings.ToLower(name), suffix, config.Region, config.Locale)
+	if config.IsForever() {
+		slug := formatCharacterSlug(realm, name)
+		return fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s%s?namespace=%s&locale=%s",
+			config.Region, slug, suffix, config.ProfileNamespace(), config.Locale)
+	}
+	return fmt.Sprintf("https://%s.api.blizzard.com/profile/wow/character/%s/%s%s?namespace=%s&locale=%s",
+		config.Region, strings.ToLower(realm), strings.ToLower(name), suffix, config.ProfileNamespace(), config.Locale)
 }
 
 // eligibleCharacters returns characters that have real profile data (no errors, level >= minLevel).

@@ -104,6 +104,7 @@ BLIZZARD_CLIENT_SECRET=your_client_secret_here
 
 REGION=eu        # us, eu, kr, tw
 LOCALE=en_GB     # en_US, en_GB, de_DE, fr_FR, es_ES, etc.
+# WOW_GAME_VERSION=retail  # retail (預設) 或 forever
 PORT=8081
 ```
 
@@ -130,6 +131,16 @@ OAuth 使用全域端點（`oauth.battle.net`），而 `REGION` 則用來選擇�
   - `LOCALE`（例如 `en_GB`、`en_US`、`zh_TW`）控制 Blizzard API 回傳的遊戲內名稱語言（物品名稱、伺服器名稱、法術與貨幣名稱）。
   - 設定 `REGION=tw` 與 `LOCALE=zh_TW` 可將應用程式設定為向台灣 Blizzard 伺服器查詢，直接以繁體中文擷取遊戲實體資料。
 
+### 遊戲版本設定 (`WOW_GAME_VERSION`)
+
+- **預設版本 (`WOW_GAME_VERSION=retail` 或未設定)**：使用標準《魔獸世界》（正式服/Retail）API，採用 `profile-{region}` 與 `static-{region}` 命名空間，以及基於伺服器的角色端點（`/profile/wow/character/{realm}/{name}`）。
+- **WoW Forever 支援 (`WOW_GAME_VERSION=forever`)**：啟用 WoW Forever 的選用支援（適用於 `tw`、`us`、`eu`、`kr` 等地區）。
+  - **命名空間**：切換為 `profile-forever-{region}` 與 `static-forever-{region}`。
+  - **角色端點**：切換至無伺服器架構的端點，格式為 `/profile/wow/character/{name}-{surname}`（小寫連字號 Slug），而非傳統的 `/profile/wow/character/{realm}/{name}`。
+  - **帳號與角色探索**：自動解析包含角色次要名稱（Surname/姓氏）與全區規則集（Ruleset，例如 Normal、PvP）的帳號資料負載。
+  - **導覽列與頁面調整**：在 Forever 模式下，全站導覽列將自動於伺服器端隱藏正式服專屬功能連結（`/vault`、`/roster`、`/mythic-plus`），並完整保留適用功能（`/`、`/professions`、`/equipment`、`/achievements`、`/history`、`/logout`）。
+  - **實驗性 API 說明**：Blizzard 的 WoW Forever API 仍屬實驗性質；未支援的端點會安全回傳錯誤或空資料，不會造成帳號探索中斷。角色通常需達到 10 級以上且登出遊戲後才會由 Blizzard API 產出詳細設定檔。
+
 ### 選項 B：Docker Compose
 
 ```bash
@@ -150,7 +161,7 @@ docker-compose up --build
 | `/professions` | 專業技能追蹤器 — 跨角色專業技能矩陣 |
 | `/achievements` | 成就 — 當前資料片與進度達 80%+ 的成就 |
 | `/mythic-plus` | 傳奇+ 地城矩陣、分數與寶庫預估 |
-| `/equipment` | 裝備檢視器 — 裝備、附魔／寶石檢查、次要屬性 |
+| `/equipment` | 裝備檢視器 — 裝備、附魔／寶石檢查、次要屬性、原生懸浮裝備提示 |
 | `/refresh` | 強制從 Battle.net 重新擷取所有角色資料 |
 
 ---

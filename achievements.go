@@ -72,7 +72,7 @@ func loadAchCategories() {
 		return
 	}
 	base := fmt.Sprintf("https://%s.api.blizzard.com/data/wow/achievement-category", config.Region)
-	suffix := fmt.Sprintf("?namespace=static-%s&locale=%s", config.Region, config.Locale)
+	suffix := fmt.Sprintf("?namespace=%s&locale=%s", config.StaticNamespace(), config.Locale)
 
 	var idx struct {
 		Categories []struct {
@@ -206,8 +206,8 @@ func getStaticAch(client *http.Client, id int) *staticAch {
 			Amount int64 `json:"amount"`
 		} `json:"criteria"`
 	}
-	u := fmt.Sprintf("https://%s.api.blizzard.com/data/wow/achievement/%d?namespace=static-%s&locale=%s",
-		config.Region, id, config.Region, config.Locale)
+	u := fmt.Sprintf("https://%s.api.blizzard.com/data/wow/achievement/%d?namespace=%s&locale=%s",
+		config.Region, id, config.StaticNamespace(), config.Locale)
 	if _, err := getJSON(client, u, &d); err != nil {
 		return nil // not cached so a later request can retry
 	}

@@ -104,6 +104,7 @@ BLIZZARD_CLIENT_SECRET=your_client_secret_here
 
 REGION=eu        # us, eu, kr, tw
 LOCALE=en_GB     # en_US, en_GB, de_DE, fr_FR, es_ES, etc.
+# WOW_GAME_VERSION=retail  # retail (default) or forever
 PORT=8081
 ```
 
@@ -130,6 +131,16 @@ OAuth uses global endpoints (`oauth.battle.net`), while `REGION` selects game da
   - `LOCALE` (e.g. `en_GB`, `en_US`, `zh_TW`) controls the language returned by the Blizzard API for in-game names (item names, realm names, spell and currency names).
   - Setting `REGION=tw` and `LOCALE=zh_TW` configures the app to query Taiwan Blizzard servers and fetch game entities directly in Traditional Chinese.
 
+### WoW Game Version (`WOW_GAME_VERSION`)
+
+- **Default (`WOW_GAME_VERSION=retail` or unset)**: Uses standard World of Warcraft (Retail) APIs with `profile-{region}` and `static-{region}` namespaces and realm-based character endpoints (`/profile/wow/character/{realm}/{name}`).
+- **WoW Forever Opt-In (`WOW_GAME_VERSION=forever`)**: Activates opt-in support for WoW Forever (supported in regions including `tw`, `us`, `eu`, `kr`).
+  - **Namespaces**: Switched to `profile-forever-{region}` and `static-forever-{region}`.
+  - **Character Endpoints**: Routes to realmless character endpoints formatted as `/profile/wow/character/{name}-{surname}` (hyphenated lowercase slug) instead of `/profile/wow/character/{realm}/{name}`.
+  - **Account & Character Discovery**: Automatically adapts account payload parsing to extract character surnames and region-wide rulesets (e.g. Normal, PvP).
+  - **Navigation & Page Adaptations**: Automatically hides Retail-specific navigation links (`/vault`, `/roster`, `/mythic-plus`) across active page headers when in Forever mode, while preserving all classic-relevant links (`/`, `/professions`, `/equipment`, `/achievements`, `/history`, `/logout`).
+  - **Experimental API Status**: Blizzard's WoW Forever endpoints are experimental; unsupported endpoints gracefully return errors or empty results without corrupting account discovery. Characters typically populate in Blizzard's profile API after reaching level 10 and logging out of the game.
+
 ### Option B: Docker Compose
 
 ```bash
@@ -150,7 +161,7 @@ Then open [http://localhost:8081](http://localhost:8081) in your browser and cli
 | `/professions` | Profession Tracker — cross-character profession skill matrix |
 | `/achievements` | Achievements — current expansion plus anything 80%+ complete |
 | `/mythic-plus` | Mythic+ dungeon matrix, rating and vault estimate |
-| `/equipment` | Equipment Inspector — gear, enchants/gems check, secondary stats |
+| `/equipment` | Equipment Inspector — gear, enchants/gems check, secondary stats, rich native hover tooltips |
 | `/refresh` | Force re-fetch of all character data from Battle.net |
 
 ---
